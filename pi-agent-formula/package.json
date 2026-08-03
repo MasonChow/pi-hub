@@ -1,0 +1,53 @@
+{
+  "name": "@masonchow/pi-agent-formula",
+  "version": "0.1.0",
+  "description": "Pi extension: F1-themed model roster and pit-stop advisor — tag models as red/yellow/white tires and switch on demand",
+  "type": "module",
+  "license": "MIT",
+  "author": "MasonChow",
+  "homepage": "https://github.com/MasonChow/pi-hub/tree/main/pi-agent-formula#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MasonChow/pi-hub.git",
+    "directory": "pi-agent-formula"
+  },
+  "bugs": "https://github.com/MasonChow/pi-hub/issues",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "model-selection",
+    "cost",
+    "router"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

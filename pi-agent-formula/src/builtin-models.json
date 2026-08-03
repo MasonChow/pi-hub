@@ -1,0 +1,226 @@
+{
+  "updated": "2026-08-01",
+  "sourceNote": "Market coding models: higher power = stronger; tags red/yellow/white/skip; deprecated=true defaults to skip. Maintain this JSON only.",
+  "fallbacks": {
+    "lightTags": [
+      "white"
+    ],
+    "oauthDefaultTags": [
+      "yellow"
+    ],
+    "apiKeyDefaultTags": [
+      "yellow"
+    ],
+    "defaultPower": 500
+  },
+  "models": [
+    {
+      "id": "gpt-5.6-sol",
+      "match": "gpt-5\\.6-sol|gpt-5\\.6.*sol",
+      "tags": [
+        "red"
+      ],
+      "note": "红胎顶档，强于 grok-4.5",
+      "power": 990
+    },
+    {
+      "id": "claude-opus-fable",
+      "match": "opus|fable",
+      "tags": [
+        "red"
+      ],
+      "note": "Anthropic 旗舰",
+      "power": 988
+    },
+    {
+      "id": "o-series-xhigh",
+      "match": "\\bo3\\b|\\bo4\\b|codex-high|xhigh",
+      "tags": [
+        "red"
+      ],
+      "power": 986
+    },
+    {
+      "id": "kimi-k3",
+      "match": "kimi.*k3|kimi-k3|moonshot.*k3",
+      "tags": [
+        "red"
+      ],
+      "power": 982
+    },
+    {
+      "id": "grok-4.5",
+      "match": "grok-4\\.5|grok-4-5|grok4\\.5",
+      "tags": [
+        "red"
+      ],
+      "note": "红胎，弱于 gpt-5.6-sol",
+      "power": 980
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "match": "deepseek.*(pro|reasoner)|v4-pro|deepseek-reasoner",
+      "tags": [
+        "red"
+      ],
+      "power": 978
+    },
+    {
+      "id": "claude-sonnet",
+      "match": "sonnet",
+      "tags": [
+        "red",
+        "yellow"
+      ],
+      "power": 972
+    },
+    {
+      "id": "gemini-pro",
+      "match": "gemini.*pro|gemini-3(?!.*flash)",
+      "tags": [
+        "red",
+        "yellow"
+      ],
+      "power": 970
+    },
+    {
+      "id": "qwen-large",
+      "match": "qwen3-coder|qwen.*72|qwen.*max",
+      "tags": [
+        "red",
+        "yellow"
+      ],
+      "power": 968
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "match": "deepseek-v4-flash|deepseek.*v4.*flash|v4-flash",
+      "tags": [
+        "yellow",
+        "white"
+      ],
+      "note": "能力≈glm-5.2，更便宜 → 黄+白",
+      "power": 962
+    },
+    {
+      "id": "glm-5.2",
+      "match": "glm-5(\\.2)?|glm5(\\.2)?",
+      "tags": [
+        "yellow",
+        "red"
+      ],
+      "note": "能力量级≈deepseek-v4-flash，略贵",
+      "power": 960
+    },
+    {
+      "id": "gpt-5.6-other",
+      "match": "gpt-5\\.6(?!.*luna)(?!.*sol)",
+      "tags": [
+        "yellow"
+      ],
+      "power": 955
+    },
+    {
+      "id": "grok-4",
+      "match": "grok-4(?!\\.5)|grok-3(?!.*mini)",
+      "tags": [
+        "yellow"
+      ],
+      "power": 952
+    },
+    {
+      "id": "gpt-4.1",
+      "match": "gpt-4\\.1",
+      "tags": [
+        "yellow"
+      ],
+      "power": 945
+    },
+    {
+      "id": "deepseek-generic",
+      "match": "deepseek",
+      "tags": [
+        "yellow",
+        "white"
+      ],
+      "power": 942
+    },
+    {
+      "id": "gpt-5.3-spark",
+      "match": "gpt-5\\.3.*spark|5\\.3-codex-spark|codex-spark",
+      "tags": [
+        "white"
+      ],
+      "note": "保留轻量线",
+      "power": 930
+    },
+    {
+      "id": "openai-light",
+      "match": "luna|mini|nano|instant",
+      "tags": [
+        "white"
+      ],
+      "power": 928
+    },
+    {
+      "id": "claude-haiku",
+      "match": "haiku",
+      "tags": [
+        "white"
+      ],
+      "power": 926
+    },
+    {
+      "id": "spark-generic",
+      "match": "(?<![0-9])spark(?![0-9])",
+      "tags": [
+        "white"
+      ],
+      "power": 924
+    },
+    {
+      "id": "deepseek-old-light",
+      "match": "deepseek.*(chat)|v3.*flash",
+      "tags": [
+        "white"
+      ],
+      "power": 922
+    },
+    {
+      "id": "gemini-flash-lite",
+      "match": "(gemini|google).*flash|\\bflash\\b|\\blite\\b|\\bsmall\\b",
+      "tags": [
+        "white"
+      ],
+      "power": 920
+    },
+    {
+      "id": "grok-light",
+      "match": "grok.*(fast|mini|lite)|grok-3-mini",
+      "tags": [
+        "white"
+      ],
+      "power": 918
+    },
+    {
+      "id": "gpt-5.4-series",
+      "match": "gpt-5\\.4",
+      "tags": [
+        "skip"
+      ],
+      "deprecated": true,
+      "note": "默认废弃，不推荐；用户可手改",
+      "power": 100
+    },
+    {
+      "id": "gpt-5.5-series",
+      "match": "gpt-5\\.5",
+      "tags": [
+        "skip"
+      ],
+      "deprecated": true,
+      "note": "默认废弃，不推荐；用户可手改",
+      "power": 99
+    }
+  ]
+}
