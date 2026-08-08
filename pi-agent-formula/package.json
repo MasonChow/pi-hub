@@ -1,6 +1,6 @@
 {
   "name": "@masonchow/pi-agent-formula",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Pi extension: F1-themed model roster and pit-stop advisor — difficulty match, quality upgrade, thrift downshift (confirm before setModel)",
   "type": "module",
   "license": "MIT",
