@@ -22,38 +22,35 @@ Pi core 已具备 `openai-responses` transport，但它按照 OpenAI Responses �
 
 ## 已落地的实现决策
 
-最终 MVP 采用 **transport override**，不复制 DeepSeek model catalog：
+最终 MVP 采用 **transport dispatcher override**，不复制 DeepSeek model catalog：
 
 ```ts
 pi.registerProvider("deepseek", {
   api: "openai-completions",
-  streamSimple: streamDeepSeekResponses,
+  streamSimple: streamDeepSeekTransport,
 });
 ```
 
-这里保留 `api: "openai-completions"` 是为了匹配 Pi 内置 DeepSeek model 的现有 API family，让 provider composer 把所有官方 DeepSeek model 路由到扩展 handler。handler 内部把 model 投影成 `openai-responses`，再调用 Pi 自带：
+这里保留 `api: "openai-completions"` 是为了匹配 Pi 内置 DeepSeek model 的现有 API family，让 provider composer 把官方 DeepSeek model 路由到扩展 dispatcher。
+
+Dispatcher 再按 DeepSeek 官方 Responses 支持范围分流：
 
 ```text
-@earendil-works/pi-ai/api/openai-responses
-```
-
-因此无需维护第二份 model id / cost / context window / auth 数据。
-
-最终链路：
-
-```text
-Pi built-in deepseek provider/catalog/auth
-  -> extension streamSimple override
+deepseek-v4-flash
   -> Pi openai-responses adapter
-  -> DeepSeek payload sanitizer
-  -> POST api.deepseek.com/responses
-     + Pi function tools
-     + DeepSeek native web_search
+  -> DeepSeek compatibility sanitizer
+  -> /responses + native web_search
+
+unsupported / unknown DeepSeek model
+  -> Pi openai-completions adapter
+  -> 原有 Chat Completions 行为
 ```
+
+这样既不维护第二份 model id / cost / context window / auth 数据，也不会因为安装扩展破坏尚未支持 Responses 的 DeepSeek catalog 模型。
 
 ## Payload compatibility
 
-发送前移除 DeepSeek 当前不支持的 OpenAI Responses 参数：
+Responses 路径发送前移除 DeepSeek 当前不支持的 OpenAI Responses 参数：
 
 ```text
 store
@@ -83,7 +80,7 @@ cacheRetention: "none"
 
 ## Native Web Search
 
-默认在最终 `tools` 中幂等追加：
+Responses 路径默认在最终 `tools` 中幂等追加：
 
 ```json
 { "type": "web_search" }
@@ -104,9 +101,9 @@ Pi function tools 原样保留。
 PI_DEEPSEEK_WEB_SEARCH=0
 ```
 
-关闭本扩展的自动注入；Responses transport 继续生效。
+关闭本扩展的自动注入；Responses transport 继续生效。Completions fallback 路径完全保持 Pi 原行为。
 
-## 当前模型范围
+## 当前模型范围与能力门控
 
 截至 2026-08-08，DeepSeek 官方 Responses 文档仍明确：
 
@@ -115,7 +112,21 @@ deepseek-v4-flash -> supported
 deepseek-v4-pro   -> not yet supported
 ```
 
-扩展不维护 hard-coded allowlist。所有 Pi 官方 `deepseek` model 都走 `/responses`；服务端新增模型支持后可直接生效。当前生产使用建议选择 `deepseek-v4-flash`。
+因此 MVP 使用显式 Responses capability allowlist：
+
+```ts
+const DEEPSEEK_RESPONSES_MODELS = new Set([
+  "deepseek-v4-flash",
+]);
+```
+
+规则：
+
+- allowlist 内模型 → `/responses`
+- allowlist 外官方 DeepSeek 模型 → 原 `/chat/completions`
+- 第三方托管 DeepSeek 模型不受扩展影响
+
+DeepSeek 官方新增 Responses 模型后，更新 allowlist 并发布新版扩展。这个显式门控优先保证安装扩展后的向后兼容性，避免对尚未支持 `/responses` 的模型产生回归。
 
 ## Transcript portability / 已知限制
 
@@ -125,6 +136,7 @@ Pi 当前 `openai-responses` parser 会忽略未知的 `web_search_call` output 
 - function tools + `web_search` 共存
 - 搜索状态事件不导致 parser 崩溃
 - 最终文本正常进入 Pi transcript
+- 未支持 Responses 的 DeepSeek 模型继续走原 completions transport
 
 当前还不能持久化并在下一轮原样 replay DeepSeek `web_search_call`。因此依赖上一轮原始搜索结果、且答案文本没有包含足够信息的 follow-up，可能缺失完整搜索上下文。
 
@@ -143,15 +155,20 @@ Pi 当前 `openai-responses` parser 会忽略未知的 `web_search_call` output 
 - versioned web search type 识别
 - web search disable
 - Responses model projection
+- Responses capability gate：V4 Flash true / V4 Pro false / unknown false / third-party false
 - provider override 不替换 models/baseUrl
 
-真实 API smoke test 仍应执行：
+真实 API smoke test 应覆盖两条链路：
 
 ```bash
+# Responses path
 pi -e ./pi-deepseek-responses/src/index.ts --provider deepseek --model deepseek-v4-flash
+
+# Completions fallback path
+pi -e ./pi-deepseek-responses/src/index.ts --provider deepseek --model deepseek-v4-pro
 ```
 
-测试 prompt：
+Responses 测试 prompt：
 
 ```text
 搜索今天 Pi coding agent 的最新版本变化，并给出来源
@@ -163,7 +180,7 @@ pi -e ./pi-deepseek-responses/src/index.ts --provider deepseek --model deepseek-
 用 bash 输出当前目录，然后告诉我结果
 ```
 
-确认两类 tool 能在同一扩展下正常工作。
+V4 Pro fallback 需要确认请求继续使用原 Chat Completions transport。
 
 ## 调试
 
@@ -171,11 +188,24 @@ pi -e ./pi-deepseek-responses/src/index.ts --provider deepseek --model deepseek-
 PI_DEEPSEEK_RESPONSES_DEBUG=1
 ```
 
+Responses：
+
+```text
+[pi-deepseek-responses] provider=deepseek model=deepseek-v4-flash api=openai-responses web_search=enabled
+```
+
+Fallback：
+
+```text
+[pi-deepseek-responses] provider=deepseek model=deepseek-v4-pro api=openai-completions responses=unsupported
+```
+
 仅打印 provider/model/api/web_search 状态与最终 tool type，不打印 API key 或完整 prompt。
 
 ## 后续迭代优先级
 
 1. 在有 `DEEPSEEK_API_KEY` 的环境完成真实 `/responses` + `web_search` smoke test。
-2. 验证 Pi 0.84.1 `openai-responses` parser 对 DeepSeek SSE 全事件集合的兼容性。
-3. 设计 extension-private `web_search_call` 持久化/replay，实现完整多轮搜索上下文。
-4. DeepSeek 官方开放 V4 Pro Responses 后补 integration coverage。
+2. 验证 `deepseek-v4-pro` fallback 仍使用 Pi 原 Chat Completions transport。
+3. 验证 Pi 0.84.1 `openai-responses` parser 对 DeepSeek SSE 全事件集合的兼容性。
+4. 设计 extension-private `web_search_call` 持久化/replay，实现完整多轮搜索上下文。
+5. DeepSeek 官方开放新 Responses 模型后更新 capability allowlist 与 integration coverage。
