@@ -5,8 +5,14 @@ import type {
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { streamSimple as streamOpenAICompletions } from "@earendil-works/pi-ai/api/openai-completions";
-import { streamSimple as streamOpenAIResponses } from "@earendil-works/pi-ai/api/openai-responses";
+// Pi's extension loader only virtualizes `@earendil-works/pi-ai` and
+// `@earendil-works/pi-ai/compat` (not `/api/*` subpaths). Import the
+// compat-exported stream helpers so both jiti extension loading and bare
+// Node unit tests resolve the same entrypoint.
+import {
+  streamSimpleOpenAICompletions as streamOpenAICompletions,
+  streamSimpleOpenAIResponses as streamOpenAIResponses,
+} from "@earendil-works/pi-ai/compat";
 
 const DEEPSEEK_RESPONSES_MODELS = new Set(["deepseek-v4-flash"]);
 

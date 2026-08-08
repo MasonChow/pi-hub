@@ -204,8 +204,19 @@ Fallback：
 
 ## 后续迭代优先级
 
-1. 在有 `DEEPSEEK_API_KEY` 的环境完成真实 `/responses` + `web_search` smoke test。
-2. 验证 `deepseek-v4-pro` fallback 仍使用 Pi 原 Chat Completions transport。
-3. 验证 Pi 0.84.1 `openai-responses` parser 对 DeepSeek SSE 全事件集合的兼容性。
+1. ~~在有 `DEEPSEEK_API_KEY` 的环境完成真实 `/responses` + `web_search` smoke test。~~ **done**（Pi 0.84.1：debug 日志 `api=openai-responses web_search=enabled`，`tools=web_search`，搜索结果含可点来源）。
+2. ~~验证 `deepseek-v4-pro` fallback 仍使用 Pi 原 Chat Completions transport。~~ **done**（debug 日志 `api=openai-completions responses=unsupported`）。
+3. ~~验证 Pi 0.84.1 `openai-responses` parser 对 DeepSeek SSE 全事件集合的兼容性。~~ **partial**：单轮搜索 + function tools 不崩溃、最终文本正常；未对全部 SSE item type 做逐事件断言。
 4. 设计 extension-private `web_search_call` 持久化/replay，实现完整多轮搜索上下文。
 5. DeepSeek 官方开放新 Responses 模型后更新 capability allowlist 与 integration coverage。
+
+## 扩展加载约束（实现笔记）
+
+Pi 0.84.1 extension loader 只 virtualize：
+
+- `@earendil-works/pi-ai` → compat entry
+- `@earendil-works/pi-ai/compat`
+- `@earendil-works/pi-ai/oauth`
+- `@earendil-works/pi-ai/providers/all`
+
+**不要**从 `@earendil-works/pi-ai/api/*` 导入 stream helpers：jiti alias 会把 `/api/...` 错误拼到 `compat.js` 路径上，扩展加载直接失败。应使用 compat 导出的 `streamSimpleOpenAICompletions` / `streamSimpleOpenAIResponses`。

@@ -116,15 +116,31 @@ npm install
 npm test
 npm run typecheck
 
-pi -e ./src/index.ts --provider deepseek --model deepseek-v4-flash
+# 建议用本包 peer 对应的 Pi 版本（当前 0.84.1）
+./node_modules/.bin/pi -e ./src/index.ts --provider deepseek --model deepseek-v4-flash
 ```
 
-真实 API smoke test建议覆盖两条链路：
+实现依赖 Pi extension loader 暴露的 `@earendil-works/pi-ai/compat` stream helpers（`streamSimpleOpenAIResponses` / `streamSimpleOpenAICompletions`）。**不要**从 `@earendil-works/pi-ai/api/*` 子路径导入——jiti 会把该路径错误拼到 `compat.js` 上导致扩展加载失败。
+
+真实 API smoke（已在 Pi 0.84.1 + DeepSeek 账号验证）：
+
+```bash
+PI_DEEPSEEK_RESPONSES_DEBUG=1 \
+  ./node_modules/.bin/pi -e ./src/index.ts --provider deepseek --model deepseek-v4-flash \
+  -p --no-session --no-tools \
+  "搜索今天 Pi coding agent 的最新版本变化，并给出来源"
+
+PI_DEEPSEEK_RESPONSES_DEBUG=1 \
+  ./node_modules/.bin/pi -e ./src/index.ts --provider deepseek --model deepseek-v4-pro \
+  -p --no-session --no-tools \
+  "用一句话回答：2+2等于几？"
+```
+
+期望 debug 行：
 
 ```text
-# Responses + native search
-使用 deepseek-v4-flash 搜索今天 Pi coding agent 的最新版本变化，并给出来源
-
-# Chat Completions fallback
-使用 deepseek-v4-pro 执行一个普通对话/工具调用，确认请求仍走原 transport
+# flash
+api=openai-responses web_search=enabled
+# pro
+api=openai-completions responses=unsupported
 ```
