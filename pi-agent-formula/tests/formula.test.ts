@@ -40,6 +40,10 @@ import {
 } from "../src/cooldown.ts";
 import { packJudgePrompt, parseJudgeVerdict, capText } from "../src/judge.ts";
 import {
+	assessDifficulty,
+	assessFit,
+} from "../src/difficulty.ts";
+import {
 	computeHeat,
 	computeNegativeFire,
 	isCorrectionIntent,
@@ -48,7 +52,12 @@ import {
 	nextToolFailStreak,
 	type SessionSignalSnapshot,
 } from "../src/signals.ts";
-import { buildSuggestion, formatSuggestionMessage } from "../src/suggest.ts";
+import { buildSuggestion, formatSuggestionMessage, resolveCurrentTire } from "../src/suggest.ts";
+import {
+	computeEconomyFire,
+	computeEconomyOpportunity,
+	thriftSaveHint,
+} from "../src/thrift.ts";
 import {
 	compareWithinTierMatch,
 	suggestTagsFromGuide,
@@ -318,6 +327,11 @@ test("parseJudgeVerdict", () => {
 	const yes = parseJudgeVerdict("SWITCH: yes\nTIER: red\nREASON: 连续纠正", ["red", "white"]);
 	assert.ok(yes?.shouldSwitch && yes.tier === "red");
 	assert.equal(parseJudgeVerdict("SWITCH: yes\nTIER: ultra\nREASON: x", ["red"]), null);
+	const eco = parseJudgeVerdict(
+		"SWITCH: yes\nTIER: white\nMODE: economy\nREASON: 任务很轻",
+		["red", "white"],
+	);
+	assert.ok(eco?.shouldSwitch && eco.tier === "white" && eco.mode === "economy");
 });
 
 test("packJudgePrompt", () => {
@@ -343,6 +357,106 @@ test("packJudgePrompt", () => {
 	});
 	assert.ok(pack.user.includes("不对，重做"));
 	assert.ok(pack.system.includes("TIRE") || pack.system.includes("Agent Formula"));
+	assert.ok(pack.system.includes("ECONOMY") || pack.system.includes("economy"));
+});
+
+test("assessDifficulty: hard vs light", () => {
+	const hard = assessDifficulty({
+		userMessages: ["请做跨模块架构重构，处理分布式竞态与迁移方案"],
+	});
+	assert.equal(hard.band, "hard");
+	assert.equal(hard.recommendedTire, "red");
+
+	const light = assessDifficulty({
+		userMessages: ["帮我格式化一下这段 JSON，改个变量名"],
+	});
+	assert.equal(light.band, "light");
+	assert.equal(light.recommendedTire, "white");
+});
+
+test("assessFit + economy fire", () => {
+	const parsed = parseFormulaConfigStructure(goodConfig);
+	assert.ok(parsed.ok);
+	if (!parsed.ok) return;
+
+	const light = assessDifficulty({ userMessages: ["简单解释一下什么是缓存"] });
+	const fitEco = assessFit("red", light);
+	assert.equal(fitEco.direction, "economy");
+	assert.equal(fitEco.targetTire, "white");
+
+	const hard = assessDifficulty({
+		userMessages: ["系统架构 redesign + migration strategy"],
+	});
+	const fitUp = assessFit("white", hard);
+	assert.equal(fitUp.direction, "upgrade");
+
+	const snapCalm: SessionSignalSnapshot = {
+		userTurnCount: 4,
+		contextPercent: 30,
+		sessionDurationMs: 10_000,
+		consecutiveCorrections: 0,
+		sameToolFailStreak: 0,
+		lastFailedTool: null,
+		explicitSwitchIntent: false,
+	};
+	const neg = computeNegativeFire(snapCalm);
+	const autoEco = computeEconomyFire(snapCalm, neg, fitEco, "oauth");
+	assert.equal(autoEco.shouldFire, true);
+	assert.equal(autoEco.targetTire, "white");
+	assert.ok(autoEco.reasons.some((r) => r.includes("订阅")));
+
+	// quality pain blocks economy
+	const snapPain = { ...snapCalm, consecutiveCorrections: 2 };
+	const blocked = computeEconomyFire(snapPain, computeNegativeFire(snapPain), fitEco);
+	assert.equal(blocked.shouldFire, false);
+
+	const manual = computeEconomyOpportunity(snapCalm, neg, fitEco, "api_key");
+	assert.equal(manual.shouldFire, true);
+	assert.ok(manual.reasons.some((r) => r.includes("API") || r.includes("按量")));
+
+	assert.equal(thriftSaveHint("oauth").includes("订阅"), true);
+	assert.equal(resolveCurrentTire(parsed.config, { provider: "anthropic", model: "claude-sonnet" }), "red");
+});
+
+test("buildSuggestion: auto path never fires match (O1)", () => {
+	const parsed = parseFormulaConfigStructure(goodConfig);
+	assert.ok(parsed.ok);
+	if (!parsed.ok) return;
+	const costBand = estimateSwitchCostBand({
+		contextTokens: 1000,
+		avgOutputTokensPerTurn: 100,
+		current: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 1 },
+		candidate: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 },
+	});
+	const hard = assessDifficulty({
+		userMessages: ["跨服务架构迁移与竞态修复"],
+	});
+	const fitUp = assessFit("white", hard);
+	// Auto: allowMatchUpgrade false — underpowered alone must not switch
+	const auto = buildSuggestion({
+		config: parsed.config,
+		current: { provider: "deepseek", model: "deepseek-v4-flash" },
+		available: catalogue.map((m) => ({ provider: m.provider, id: m.id })),
+		snap: {
+			userTurnCount: 2,
+			contextPercent: 20,
+			sessionDurationMs: 1000,
+			consecutiveCorrections: 0,
+			sameToolFailStreak: 0,
+			lastFailedTool: null,
+			explicitSwitchIntent: false,
+		},
+		heat: { score: 10, reasons: [] },
+		negative: { shouldFire: false, reasons: [] },
+		fit: fitUp,
+		allowMatchUpgrade: false,
+		judgeShouldSwitch: true,
+		judgeTier: "red",
+		judgeMode: "match",
+		costBand,
+	});
+	assert.equal(auto.shouldSwitch, false);
+	assert.equal(auto.mode, "none");
 });
 
 test("formatTireRoster: groups by priority, marks current", () => {
@@ -374,6 +488,11 @@ test("formatSuggestionMessage: no roster dump", () => {
 			tierName: "red",
 			reason: "连续纠正",
 			costSummary: costBand.summary,
+			mode: "quality",
+			fit: assessFit(
+				"white",
+				assessDifficulty({ userMessages: ["重构架构"] }),
+			),
 			candidates: [
 				{ tier: "red", ref: { provider: "openai-codex", model: "gpt-5" } },
 				{ tier: "white", ref: { provider: "deepseek", model: "deepseek-v4-flash" } },
@@ -382,8 +501,9 @@ test("formatSuggestionMessage: no roster dump", () => {
 		{ provider: "deepseek", model: "deepseek-v4-flash" },
 	);
 	assert.ok(msg.includes("是否建议换模型"));
-	assert.ok(msg.includes("建议:"));
+	assert.ok(msg.includes("建议"));
 	assert.ok(msg.includes("当前: deepseek/deepseek-v4-flash"));
+	assert.ok(msg.includes("难度:"));
 	assert.ok(!msg.includes("可选档位"), "roster belongs in /formula-tires, not box call");
 });
 
@@ -415,8 +535,73 @@ test("buildSuggestion uses tag priority", () => {
 		costBand,
 	});
 	assert.equal(s.shouldSwitch, true);
+	assert.equal(s.mode, "quality");
 	assert.ok(s.target);
 	assert.notEqual(modelKey(s.target!.provider, s.target!.model), "deepseek/deepseek-v4-flash");
+});
+
+test("buildSuggestion: economy downshift and match upgrade", () => {
+	const parsed = parseFormulaConfigStructure(goodConfig);
+	assert.ok(parsed.ok);
+	if (!parsed.ok) return;
+	const costBand = estimateSwitchCostBand({
+		contextTokens: 1000,
+		avgOutputTokensPerTurn: 100,
+		current: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 15 },
+		candidate: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1 },
+	});
+	const light = assessDifficulty({ userMessages: ["格式化这段代码"] });
+	const fitEco = assessFit("red", light);
+	const eco = buildSuggestion({
+		config: parsed.config,
+		current: { provider: "anthropic", model: "claude-sonnet" },
+		available: catalogue.map((m) => ({ provider: m.provider, id: m.id })),
+		snap: {
+			userTurnCount: 3,
+			contextPercent: 20,
+			sessionDurationMs: 1000,
+			consecutiveCorrections: 0,
+			sameToolFailStreak: 0,
+			lastFailedTool: null,
+			explicitSwitchIntent: false,
+		},
+		heat: { score: 5, reasons: [] },
+		negative: { shouldFire: false, reasons: [] },
+		fit: fitEco,
+		economy: { shouldFire: true, targetTire: "white", reasons: ["过配"] },
+		costBand,
+	});
+	assert.equal(eco.shouldSwitch, true);
+	assert.equal(eco.mode, "economy");
+	assert.equal(eco.tierName, "white");
+	assert.equal(eco.target?.model, "deepseek-v4-flash");
+
+	const hard = assessDifficulty({
+		userMessages: ["跨服务架构迁移与竞态修复"],
+	});
+	const fitUp = assessFit("white", hard);
+	const match = buildSuggestion({
+		config: parsed.config,
+		current: { provider: "deepseek", model: "deepseek-v4-flash" },
+		available: catalogue.map((m) => ({ provider: m.provider, id: m.id })),
+		snap: {
+			userTurnCount: 1,
+			contextPercent: 10,
+			sessionDurationMs: 500,
+			consecutiveCorrections: 0,
+			sameToolFailStreak: 0,
+			lastFailedTool: null,
+			explicitSwitchIntent: false,
+		},
+		heat: { score: 10, reasons: [] },
+		negative: { shouldFire: false, reasons: [] },
+		fit: fitUp,
+		allowMatchUpgrade: true,
+		costBand,
+	});
+	assert.equal(match.shouldSwitch, true);
+	assert.equal(match.mode, "match");
+	assert.ok(match.tierName === "red" || match.tierName === "yellow");
 });
 
 test("buildSuggestion: judge no does not pick; null judge does not suppress rules", () => {

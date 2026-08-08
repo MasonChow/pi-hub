@@ -7,7 +7,7 @@
 | 包 | 做什么 | 入口 |
 |---|---|---|
 | [`@masonchow/pi-hud`](./pi-hud) | Claude Code statusline 风格的 HUD：模型、上下文水位、额度/花费、缓存命中率、subagent 消耗 | `/hud` |
-| [`@masonchow/pi-agent-formula`](./pi-agent-formula) | F1 主题的模型阵容与进站换模顾问：把模型按轮胎强度打标，一句 `/boxbox` 决定换不换 | `/formula-config` `/formula-tires` `/boxbox` |
+| [`@masonchow/pi-agent-formula`](./pi-agent-formula) | F1 进站顾问：红黄白打标；难度升档 / 质量升档 / 省耗降档；确认后才换模 | `/formula-config` `/formula-tires` `/boxbox` |
 | [`@masonchow/pi-claude-rules`](./pi-claude-rules) | 按 Claude Code 语义消费 `.claude/rules/`，同一套规则库在 Pi 里表现一致 | `/rules` |
 
 ## 快速开始

@@ -4,10 +4,12 @@
  * Commands:
  *   /formula-config  — conversational create/update of ~/.pi/agent/formula-pit.json
  *   /formula-tires   — view configured tire roster (what box can pick)
- *   /boxbox          — Box box! assess switch (cost band + confirm → setModel)
+ *   /boxbox          — Box box! assess switch (difficulty + thrift + cost + confirm → setModel)
  *
- * Auto: negative signals (corrections / tool fails / explicit intent) → async suggest
- * Volume (turns/context/time) only raises heat, never sole auto-trigger.
+ * Auto:
+ *   - quality: negative signals (corrections / tool fails / explicit intent)
+ *   - economy: calm session + overprovisioned tire → thrift downshift
+ * Volume (turns/context/time) only raises heat, never sole auto-trigger for upgrades.
  *
  * Install: pi install npm:@masonchow/pi-agent-formula
  */
@@ -27,12 +29,18 @@ import {
 	loadFormulaConfig,
 	modelKey,
 	pickByTagPriority,
+	readProviderAuthKind,
 	saveFormulaConfig,
 	type AvailableModel,
 	type FormulaConfig,
 	type ModelRef,
 } from "./config.ts";
 import { estimateSwitchCostBand, ratesFromModelCost, type CostBand } from "./cost.ts";
+import {
+	assessDifficulty,
+	assessFit,
+	type FitAssessment,
+} from "./difficulty.ts";
 import {
 	capText,
 	DEFAULT_ASSISTANT_EXCERPT_CHARS,
@@ -49,10 +57,20 @@ import {
 	nextToolFailStreak,
 	type SessionSignalSnapshot,
 } from "./signals.ts";
-import { buildSuggestion, formatSuggestionMessage, type Suggestion } from "./suggest.ts";
+import {
+	buildSuggestion,
+	formatSuggestionMessage,
+	resolveCurrentTire,
+	type Suggestion,
+} from "./suggest.ts";
+import {
+	computeEconomyFire,
+	computeEconomyOpportunity,
+} from "./thrift.ts";
 import {
 	enterCooldown,
 	isInCooldown,
+	type CooldownKind,
 	type CooldownState,
 } from "./cooldown.ts";
 
@@ -179,10 +197,25 @@ function buildSnapshot(
 	};
 }
 
+function buildSessionFit(
+	ctx: ExtensionContext,
+	config: FormulaConfig,
+	snap: SessionSignalSnapshot,
+): FitAssessment {
+	const { userMessages } = collectMessages(ctx);
+	const difficulty = assessDifficulty({
+		userMessages,
+		consecutiveCorrections: snap.consecutiveCorrections,
+		sameToolFailStreak: snap.sameToolFailStreak,
+	});
+	return assessFit(resolveCurrentTire(config, currentRef(ctx)), difficulty);
+}
+
 async function runJudge(
 	ctx: ExtensionContext,
 	config: FormulaConfig,
 	snap: SessionSignalSnapshot,
+	fit: FitAssessment,
 ): Promise<JudgeVerdict | null> {
 	const model = ctx.modelRegistry.find(config.judge.provider, config.judge.model);
 	if (!model) return null;
@@ -200,6 +233,7 @@ async function runJudge(
 		userMessages,
 		assistantExcerpts,
 		tierNames: allConfigTags(config),
+		fit,
 	});
 
 	try {
@@ -237,15 +271,36 @@ function makeSuggestion(
 	config: FormulaConfig,
 	snap: SessionSignalSnapshot,
 	judge: JudgeVerdict | null,
+	opts: { manual: boolean; fit: FitAssessment },
 ): Suggestion {
 	const heat = computeHeat(snap);
 	const negative = computeNegativeFire(snap);
 	const available = listAvailable(ctx);
+	const cur = currentRef(ctx);
+	const auth = cur
+		? readProviderAuthKind(defaultAuthPath(), cur.provider)
+		: "none";
+	const economy = opts.manual
+		? computeEconomyOpportunity(snap, negative, opts.fit, auth)
+		: computeEconomyFire(snap, negative, opts.fit, auth);
+
+	// Provisional target for cost band: preferred tire from fit/economy/judge
+	const preferred =
+		judge?.tier ??
+		(negative.shouldFire
+			? opts.fit.direction === "upgrade"
+				? opts.fit.targetTire
+				: "red"
+			: economy.shouldFire
+				? economy.targetTire
+				: opts.fit.direction === "upgrade"
+					? opts.fit.targetTire
+					: null);
 	const pick = pickByTagPriority(
 		config,
 		currentRef(ctx),
 		available,
-		judge?.tier ?? null,
+		preferred,
 	);
 	const provisional = pick?.ref ?? config.models[0] ?? null;
 	const band = costBandFor(
@@ -261,11 +316,20 @@ function makeSuggestion(
 		snap,
 		heat,
 		negative,
+		fit: opts.fit,
+		economy,
+		allowMatchUpgrade: opts.manual,
 		judgeReason: judge?.reason ?? null,
 		judgeTier: judge?.tier ?? null,
 		judgeShouldSwitch: judge ? judge.shouldSwitch : null,
+		judgeMode: judge?.mode ?? null,
 		costBand: band,
 	});
+}
+
+function cooldownKindFromSuggestion(s: Suggestion): CooldownKind {
+	if (s.mode === "economy" || s.mode === "quality" || s.mode === "match") return s.mode;
+	return "generic";
 }
 
 async function presentSuggestion(
@@ -292,10 +356,18 @@ async function presentSuggestion(
 				: suggestion.tierName === "white"
 					? "白胎·省而耐"
 					: suggestion.tierName ?? "?";
-	const label = `${tire} → ${modelKey(target.provider, target.model)}`;
+	const modeHint =
+		suggestion.mode === "economy"
+			? "省耗降档"
+			: suggestion.mode === "match"
+				? "难度升档"
+				: suggestion.mode === "quality"
+					? "质量升档"
+					: "换胎";
+	const label = `${modeHint} ${tire} → ${modelKey(target.provider, target.model)}`;
 	const ok = await ctx.ui.confirm(
 		"Box box!",
-		`${msg}\n\nBox box! 确认进站切换到 ${label}？\n（切换会丢失 prompt cache 连续性）`,
+		`${msg}\n\nBox box! 确认进站（${modeHint}）到 ${label}？\n（切换会丢失 prompt cache 连续性）`,
 	);
 	if (!ok) {
 		ctx.ui.notify("已忽略本次 box 建议", "info");
@@ -582,7 +654,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("boxbox", {
-		description: "Assess whether to switch models; confirm to apply",
+		description:
+			"Assess task difficulty + thrift: upgrade if underpowered, downshift to save cost; confirm to apply",
 		handler: async (_args, ctx) => {
 			if (!ctx.isIdle()) {
 				ctx.ui.notify("Agent busy — try /boxbox when idle", "warning");
@@ -612,14 +685,27 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const snap = buildSnapshot(ctx, tracking());
-			ctx.ui.notify("Agent Formula: 评估中…", "info");
+			ctx.ui.notify("Agent Formula: 评估难度与省耗…", "info");
 
-			// Prefer async judge; fall back to rules
-			const judge = await runJudge(ctx, loaded.config, snap);
-			const suggestion = makeSuggestion(ctx, loaded.config, snap, judge);
+			const fit = buildSessionFit(ctx, loaded.config, snap);
+			// Prefer async judge; fall back to rules (difficulty + thrift + quality)
+			const judge = await runJudge(ctx, loaded.config, snap, fit);
+			const suggestion = makeSuggestion(ctx, loaded.config, snap, judge, {
+				manual: true,
+				fit,
+			});
 
 			await presentSuggestion(pi, ctx, suggestion, (dismissed) => {
-				cooldown = enterCooldown(Date.now(), computeNegativeFire(snap).reasons, dismissed);
+				const reasons =
+					suggestion.mode === "economy"
+						? suggestion.fit?.reasons ?? ["economy"]
+						: computeNegativeFire(snap).reasons;
+				cooldown = enterCooldown(
+					Date.now(),
+					reasons.length ? reasons : [suggestion.mode],
+					dismissed,
+					cooldownKindFromSuggestion(suggestion),
+				);
 				turnsSinceSuggest = 0;
 			});
 		},
@@ -686,59 +772,71 @@ export default function (pi: ExtensionAPI) {
 
 		const snap = buildSnapshot(ctx, tracking());
 		const negative = computeNegativeFire(snap);
-		if (!negative.shouldFire) return;
 
 		const available = listAvailable(ctx);
 		const loaded = loadFormulaConfig(configPath, available);
 
+		// Economy needs config+fit; quality negative can still nudge missing config.
 		if (loaded.status !== "ok") {
-			// Only nudge when a negative signal would have fired — not on every idle agent_end.
-			if (!nudgedMissingConfig) {
+			if (negative.shouldFire && !nudgedMissingConfig) {
 				nudgedMissingConfig = true;
 				ctx.ui.notify("Agent Formula 未配置：需要时运行 /formula-config", "info");
 			}
 			return;
 		}
 
+		const fit = buildSessionFit(ctx, loaded.config, snap);
+		const economy = computeEconomyFire(snap, negative, fit);
+		if (!negative.shouldFire && !economy.shouldFire) return;
+
 		const now = Date.now();
 		if (isInCooldown(cooldown, now, turnsSinceSuggest)) {
-			// Allow early break only if new stronger explicit switch intent
-			if (!(snap.explicitSwitchIntent && cooldown?.dismissed)) {
-				return;
-			}
+			// Quality / explicit can break economy cooldown; dismissed quality needs explicit.
+			const canBreak =
+				(snap.explicitSwitchIntent && cooldown?.dismissed) ||
+				(negative.shouldFire && cooldown?.kind === "economy");
+			if (!canBreak) return;
 		}
 
 		autoRunning = true;
 		try {
-			// Fire-and-forget judge off the critical path: schedule microtask so agent_end returns.
 			const config = loaded.config;
-			const reasons = negative.reasons;
+			const reasons = negative.shouldFire ? negative.reasons : economy.reasons;
 			void (async () => {
 				try {
-					const judge = await runJudge(ctx, config, snap);
-					const suggestion = makeSuggestion(ctx, config, snap, judge);
+					const judge = await runJudge(ctx, config, snap, fit);
+					const suggestion = makeSuggestion(ctx, config, snap, judge, {
+						manual: false,
+						fit,
+					});
+					const kind = cooldownKindFromSuggestion(suggestion);
 					if (!suggestion.shouldSwitch) {
-						cooldown = enterCooldown(Date.now(), reasons, true);
+						cooldown = enterCooldown(Date.now(), reasons, true, kind);
 						turnsSinceSuggest = 0;
 						explicitSwitch = false;
 						return;
 					}
 					if (!ctx.isIdle()) {
-						// Don't block a busy session with confirm — surface summary and point to /boxbox
+						const modeZh =
+							suggestion.mode === "economy"
+								? "省耗降档"
+								: suggestion.mode === "match"
+									? "难度升档"
+									: "质量升档";
 						ctx.ui.notify(
-							`Agent Formula: 建议切换 ${suggestion.tierName ?? ""} → ${
+							`Agent Formula: 建议${modeZh} ${suggestion.tierName ?? ""} → ${
 								suggestion.target
 									? modelKey(suggestion.target.provider, suggestion.target.model)
 									: "?"
-							}（${suggestion.reason.slice(0, 80)}）。空闲时运行 /boxbox（Box box）确认。`,
+							}（${suggestion.reason.slice(0, 80)}）。空闲时运行 /boxbox 确认。`,
 							"warning",
 						);
-						cooldown = enterCooldown(Date.now(), reasons, false);
+						cooldown = enterCooldown(Date.now(), reasons, false, kind);
 						turnsSinceSuggest = 0;
 						return;
 					}
 					await presentSuggestion(pi, ctx, suggestion, (dismissed) => {
-						cooldown = enterCooldown(Date.now(), reasons, dismissed);
+						cooldown = enterCooldown(Date.now(), reasons, dismissed, kind);
 						turnsSinceSuggest = 0;
 						explicitSwitch = false;
 					});
