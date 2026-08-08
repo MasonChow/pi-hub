@@ -10,8 +10,8 @@ import type {
 // compat-exported stream helpers so both jiti extension loading and bare
 // Node unit tests resolve the same entrypoint.
 import {
-  streamSimpleOpenAICompletions as streamOpenAICompletions,
-  streamSimpleOpenAIResponses as streamOpenAIResponses,
+  streamSimpleOpenAICompletions as defaultStreamOpenAICompletions,
+  streamSimpleOpenAIResponses as defaultStreamOpenAIResponses,
 } from "@earendil-works/pi-ai/compat";
 
 const DEEPSEEK_RESPONSES_MODELS = new Set(["deepseek-v4-flash"]);
@@ -33,6 +33,17 @@ const UNSUPPORTED_TOP_LEVEL_FIELDS = [
   "previous_response_id",
   "conversation",
 ] as const;
+
+/** Stream adapters used by the transport dispatcher. Injectable for unit tests. */
+export type DeepSeekStreamAdapters = {
+  streamOpenAIResponses: typeof defaultStreamOpenAIResponses;
+  streamOpenAICompletions: typeof defaultStreamOpenAICompletions;
+};
+
+const defaultStreamAdapters: DeepSeekStreamAdapters = {
+  streamOpenAIResponses: defaultStreamOpenAIResponses,
+  streamOpenAICompletions: defaultStreamOpenAICompletions,
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -121,23 +132,19 @@ export function toResponsesModel(model: Model<Api>): Model<"openai-responses"> {
   } as Model<"openai-responses">;
 }
 
-export function streamDeepSeekResponses(
-  model: Model<Api>,
-  context: Context,
+/**
+ * Build SimpleStreamOptions for the Responses path: force cacheRetention off
+ * and wrap onPayload so DeepSeek sanitization re-runs after any upstream hook.
+ * Exported for unit tests that assert final wire-payload behavior.
+ */
+export function buildDeepSeekResponsesStreamOptions(
   options?: SimpleStreamOptions,
-) {
-  const responseModel = toResponsesModel(model);
+): SimpleStreamOptions {
   const webSearch = isWebSearchEnabled(options);
   const debug = isDebugEnabled(options);
   const upstreamOnPayload = options?.onPayload;
 
-  if (debug) {
-    console.error(
-      `[pi-deepseek-responses] provider=${model.provider} model=${model.id} api=openai-responses web_search=${webSearch ? "enabled" : "disabled"}`,
-    );
-  }
-
-  return streamOpenAIResponses(responseModel, context, {
+  return {
     ...options,
     // DeepSeek manages prefix caching automatically and does not accept OpenAI's
     // prompt-cache request fields.
@@ -166,7 +173,30 @@ export function streamDeepSeekResponses(
 
       return next;
     },
-  });
+  };
+}
+
+export function streamDeepSeekResponses(
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+  adapters: DeepSeekStreamAdapters = defaultStreamAdapters,
+) {
+  const responseModel = toResponsesModel(model);
+  const webSearch = isWebSearchEnabled(options);
+  const debug = isDebugEnabled(options);
+
+  if (debug) {
+    console.error(
+      `[pi-deepseek-responses] provider=${model.provider} model=${model.id} api=openai-responses web_search=${webSearch ? "enabled" : "disabled"}`,
+    );
+  }
+
+  return adapters.streamOpenAIResponses(
+    responseModel,
+    context,
+    buildDeepSeekResponsesStreamOptions(options),
+  );
 }
 
 /**
@@ -177,6 +207,7 @@ export function streamDeepSeekTransport(
   model: Model<Api>,
   context: Context,
   options?: SimpleStreamOptions,
+  adapters: DeepSeekStreamAdapters = defaultStreamAdapters,
 ) {
   if (!supportsDeepSeekResponses(model)) {
     if (isDebugEnabled(options)) {
@@ -184,14 +215,14 @@ export function streamDeepSeekTransport(
         `[pi-deepseek-responses] provider=${model.provider} model=${model.id} api=openai-completions responses=unsupported`,
       );
     }
-    return streamOpenAICompletions(
+    return adapters.streamOpenAICompletions(
       model as Model<"openai-completions">,
       context,
       options,
     );
   }
 
-  return streamDeepSeekResponses(model, context, options);
+  return streamDeepSeekResponses(model, context, options, adapters);
 }
 
 export default function deepSeekResponsesExtension(pi: ExtensionAPI): void {
