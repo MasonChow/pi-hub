@@ -6,6 +6,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import deepSeekResponsesExtension, {
   hasNativeWebSearchTool,
   prepareDeepSeekResponsesPayload,
+  supportsDeepSeekResponses,
   toResponsesModel,
 } from "../src/index.ts";
 
@@ -60,6 +61,25 @@ test("non-object payload passes through", () => {
   assert.equal(prepareDeepSeekResponsesPayload("hello"), "hello");
 });
 
+test("Responses capability is explicitly gated by official provider and supported model", () => {
+  assert.equal(
+    supportsDeepSeekResponses({ provider: "deepseek", id: "deepseek-v4-flash" }),
+    true,
+  );
+  assert.equal(
+    supportsDeepSeekResponses({ provider: "deepseek", id: "deepseek-v4-pro" }),
+    false,
+  );
+  assert.equal(
+    supportsDeepSeekResponses({ provider: "openrouter", id: "deepseek-v4-flash" }),
+    false,
+  );
+  assert.equal(
+    supportsDeepSeekResponses({ provider: "deepseek", id: "future-model" }),
+    false,
+  );
+});
+
 test("toResponsesModel keeps provider/catalog metadata and changes only transport semantics", () => {
   const model = {
     id: "deepseek-v4-flash",
@@ -82,7 +102,7 @@ test("toResponsesModel keeps provider/catalog metadata and changes only transpor
   assert.equal(result.contextWindow, model.contextWindow);
 });
 
-test("extension overrides only the existing deepseek transport", () => {
+test("extension overrides only the existing deepseek transport dispatcher", () => {
   let registration: { name: string; config: Record<string, unknown> } | undefined;
   const pi = {
     registerProvider(name: string, config: Record<string, unknown>) {
