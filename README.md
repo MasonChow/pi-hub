@@ -9,6 +9,7 @@
 | [`@masonchow/pi-hud`](./pi-hud) | Claude Code statusline 风格的 HUD：模型、上下文水位、额度/花费、缓存命中率、subagent 消耗 | `/hud` |
 | [`@masonchow/pi-agent-formula`](./pi-agent-formula) | F1 进站顾问：红黄白打标；难度升档 / 质量升档 / 省耗降档；确认后才换模 | `/formula-config` `/formula-tires` `/boxbox` |
 | [`@masonchow/pi-claude-rules`](./pi-claude-rules) | 按 Claude Code 语义消费 `.claude/rules/`，同一套规则库在 Pi 里表现一致 | `/rules` |
+| [`@masonchow/pi-deepseek-responses`](./pi-deepseek-responses) | 官方 DeepSeek provider 透明切 `/responses`，保留 Pi function tools 并启用 DeepSeek 原生 `web_search` | 自动生效 |
 
 ## 快速开始
 
@@ -28,13 +29,13 @@ pi install -l npm:@masonchow/pi-claude-rules
 
 ## 适用范围
 
-✅ Pi coding agent 0.81.1 及以上
-✅ Node.js 20+
+✅ Pi coding agent 0.81.1 及以上（`pi-deepseek-responses` 按 Pi 0.84.1 API 开发）
+✅ Node.js 20+（`pi-deepseek-responses` 需要 Node.js 22.19+）
 ✅ TypeScript 源码直接发布，装完不需要构建步骤
-✅ 三个包互不依赖，按需单独安装
+✅ 四个包互不依赖，按需单独安装
 
 ❌ 不是 Claude Code / Cursor / Codex 的扩展（`pi-claude-rules` 只是复用 Claude Code 的规则文件格式）
-❌ 不提供 Pi 本体的功能补丁或 fork
+❌ 不 fork Pi core；provider-specific 行为通过 Pi extension API 实现
 
 ## 提问与反馈
 
