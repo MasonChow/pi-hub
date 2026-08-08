@@ -5,7 +5,10 @@ import type {
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import { streamSimple as streamOpenAICompletions } from "@earendil-works/pi-ai/api/openai-completions";
 import { streamSimple as streamOpenAIResponses } from "@earendil-works/pi-ai/api/openai-responses";
+
+const DEEPSEEK_RESPONSES_MODELS = new Set(["deepseek-v4-flash"]);
 
 const UNSUPPORTED_TOP_LEVEL_FIELDS = [
   "store",
@@ -37,6 +40,17 @@ function envFlag(options: SimpleStreamOptions | undefined, name: string, fallbac
   const value = envValue(options, name);
   if (value === undefined) return fallback;
   return !["0", "false", "off", "no"].includes(value.trim().toLowerCase());
+}
+
+/**
+ * DeepSeek's Responses API is currently model-gated. Keep this explicit so
+ * installing the extension never breaks catalog models that still require
+ * /chat/completions.
+ */
+export function supportsDeepSeekResponses(
+  model: Pick<Model<Api>, "provider" | "id">,
+): boolean {
+  return model.provider === "deepseek" && DEEPSEEK_RESPONSES_MODELS.has(model.id);
 }
 
 export function isWebSearchEnabled(options?: SimpleStreamOptions): boolean {
@@ -149,13 +163,39 @@ export function streamDeepSeekResponses(
   });
 }
 
+/**
+ * Route only models confirmed to support DeepSeek Responses through /responses.
+ * All other official DeepSeek models retain Pi's original completions behavior.
+ */
+export function streamDeepSeekTransport(
+  model: Model<Api>,
+  context: Context,
+  options?: SimpleStreamOptions,
+) {
+  if (!supportsDeepSeekResponses(model)) {
+    if (isDebugEnabled(options)) {
+      console.error(
+        `[pi-deepseek-responses] provider=${model.provider} model=${model.id} api=openai-completions responses=unsupported`,
+      );
+    }
+    return streamOpenAICompletions(
+      model as Model<"openai-completions">,
+      context,
+      options,
+    );
+  }
+
+  return streamDeepSeekResponses(model, context, options);
+}
+
 export default function deepSeekResponsesExtension(pi: ExtensionAPI): void {
   // Keep Pi's built-in DeepSeek model catalog, base URL and authentication.
   // Matching the existing `openai-completions` API is intentional: provider
-  // composition then routes every built-in DeepSeek model into this custom
-  // stream handler, where we internally call Pi's Responses adapter.
+  // composition routes official DeepSeek models into this transport dispatcher,
+  // which upgrades only Responses-capable models and delegates the rest back to
+  // Pi's original completions adapter.
   pi.registerProvider("deepseek", {
     api: "openai-completions",
-    streamSimple: streamDeepSeekResponses,
+    streamSimple: streamDeepSeekTransport,
   });
 }
