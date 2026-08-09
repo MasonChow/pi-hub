@@ -449,6 +449,45 @@ export async function resolveOpencodeGoCredentials(
 	return cfg;
 }
 
+/** 拉取结果原因：区分登录态问题 vs 一般不可用 */
+export type GoQuotaFetchReason = "ok" | "auth_expired" | "unavailable" | "no_credentials";
+
+export interface GoQuotaFetchOutcome {
+	quota: GoQuota | null;
+	reason: GoQuotaFetchReason;
+}
+
+export const GO_AUTH_NOTIFY_MESSAGE =
+	"OpenCode Go 登录态失效：请在 Chrome 打开 https://opencode.ai/workspace 重新登录，额度显示会自动恢复";
+
+/**
+ * 根据 dashboard HTTP 响应判断是登录失效还是其它错误。
+ * 纯函数，便于单测。
+ */
+export function classifyDashboardAuthFailure(
+	status: number,
+	finalUrl: string,
+	html: string,
+): Exclude<GoQuotaFetchReason, "ok"> {
+	if (status === 401 || status === 403) return "auth_expired";
+	// 被踢到登录/鉴权页
+	if (/\/(auth|login|signin|sign-in|sign_in)\b/i.test(finalUrl)) return "auth_expired";
+	const low = html.toLowerCase();
+	// 登录表单强信号
+	if (low.includes('type="password"') || low.includes("type='password'") || low.includes('name="password"')) {
+		return "auth_expired";
+	}
+	// 无 usage 且文案像登录墙
+	if (
+		!low.includes("rollingusage") &&
+		!low.includes('data-slot="usage-item"') &&
+		(/(sign\s*in|log\s*in|登录|登陆)/i.test(html) || low.includes("oauth") && low.includes("continue with"))
+	) {
+		return "auth_expired";
+	}
+	return "unavailable";
+}
+
 export async function fetchOpencodeGoUsageOfficial(apiKey: string, timeoutMs = 5000): Promise<GoQuota | null> {
 	const res = await fetch(OFFICIAL_USAGE_URL, {
 		headers: {
@@ -471,61 +510,79 @@ export async function fetchOpencodeGoUsageDashboard(
 	workspaceId: string,
 	authCookie: string,
 	timeoutMs = 10000,
-): Promise<GoQuota | null> {
+): Promise<GoQuotaFetchOutcome> {
 	const cookieHeader = authCookie.startsWith("auth=") ? authCookie : `auth=${authCookie}`;
 	const url = `https://opencode.ai/workspace/${encodeURIComponent(workspaceId)}/go`;
-	const res = await fetch(url, {
-		headers: {
-			Cookie: cookieHeader,
-			Accept: "text/html",
-			"User-Agent": DASHBOARD_UA,
-		},
-		signal: AbortSignal.timeout(timeoutMs),
-		redirect: "follow",
-	});
-	if (!res.ok) return null;
-	const html = await res.text();
-	return parseOpencodeGoDashboardHtml(html);
+	let res: Response;
+	try {
+		res = await fetch(url, {
+			headers: {
+				Cookie: cookieHeader,
+				Accept: "text/html",
+				"User-Agent": DASHBOARD_UA,
+			},
+			signal: AbortSignal.timeout(timeoutMs),
+			redirect: "follow",
+		});
+	} catch {
+		return { quota: null, reason: "unavailable" };
+	}
+
+	const html = await res.text().catch(() => "");
+	const finalUrl = res.url || url;
+	if (res.ok) {
+		const quota = parseOpencodeGoDashboardHtml(html);
+		if (quota) return { quota, reason: "ok" };
+		return { quota: null, reason: classifyDashboardAuthFailure(res.status, finalUrl, html) };
+	}
+	return { quota: null, reason: classifyDashboardAuthFailure(res.status, finalUrl, html) };
 }
 
 /**
  * 查 OpenCode Go 额度：官方 API → dashboard scrape。
- * 都失败返回 null（调用方标记 ✗ 并清掉陈旧值）。
+ * 返回结构化 reason，供 HUD 区分「需重登」与一般失败。
  */
 export async function fetchOpencodeGoQuota(opts: {
 	apiKey?: string;
 	agentDir?: string;
 	env?: NodeJS.ProcessEnv;
-}): Promise<GoQuota | null> {
+}): Promise<GoQuotaFetchOutcome> {
 	if (opts.apiKey) {
 		try {
 			const official = await fetchOpencodeGoUsageOfficial(opts.apiKey);
-			if (official) return official;
+			if (official) return { quota: official, reason: "ok" };
 		} catch {
 			/* 404 / 网络 → 回退 scrape */
 		}
 	}
 
 	const creds = await resolveOpencodeGoCredentials(opts.agentDir, opts.env);
-	if (!creds.workspaceId || !creds.authCookie) return null;
-	try {
-		return await fetchOpencodeGoUsageDashboard(creds.workspaceId, creds.authCookie);
-	} catch {
-		return null;
+	if (!creds.workspaceId || !creds.authCookie) {
+		return { quota: null, reason: "no_credentials" };
 	}
+	return fetchOpencodeGoUsageDashboard(creds.workspaceId, creds.authCookie);
 }
 
 /**
  * 应用一次 Go 额度拉取结果（纯函数，供测试与 HUD 共用）。
- * 失败时清掉陈旧 quota，避免「失败却仍显示旧剩余」。
+ * 失败时清掉陈旧 quota；auth/no_credentials 标记 goAuthExpired。
  */
 export function applyGoQuotaFetchResult(
 	_prev: GoQuota | null,
-	next: GoQuota | null,
-): { goQuota: GoQuota | null; goQuotaFailed: boolean } {
-	// 刷新失败时清掉陈旧值：宁可显示 ✗，也不展示过期剩余（_prev 故意不复用）
-	if (next) return { goQuota: next, goQuotaFailed: false };
-	return { goQuota: null, goQuotaFailed: true };
+	outcome: GoQuotaFetchOutcome,
+): { goQuota: GoQuota | null; goQuotaFailed: boolean; goAuthExpired: boolean } {
+	if (outcome.reason === "ok" && outcome.quota) {
+		return { goQuota: outcome.quota, goQuotaFailed: false, goAuthExpired: false };
+	}
+	const goAuthExpired = outcome.reason === "auth_expired" || outcome.reason === "no_credentials";
+	return { goQuota: null, goQuotaFailed: true, goAuthExpired };
+}
+
+/**
+ * 是否应弹出登录提醒：仅在「新进入」auth 失效态时 true（避免每 5 分钟刷屏）。
+ */
+export function shouldNotifyGoAuthExpired(prevAuthExpired: boolean, nextAuthExpired: boolean): boolean {
+	return nextAuthExpired && !prevAuthExpired;
 }
 
 /** 渲染用：按稳定顺序产出标签 + 窗口 */
@@ -539,9 +596,13 @@ export function goQuotaWindowEntries(q: GoQuota): Array<{ label: string; window:
 
 /**
  * HUD 第 1 行 Go 额度文案片段（无 theme 时用纯文本；测试覆盖接线）。
- * failed 且无有效窗口 → "额度 ✗"；未失败未就绪 → "额度 —"
+ * auth 失效 → "额度 ✗ 需重登"；其它失败 → "额度 ✗"；未就绪 → "额度 —"
  */
-export function formatGoQuotaStatusText(goQuota: GoQuota | null, goQuotaFailed: boolean): string {
+export function formatGoQuotaStatusText(
+	goQuota: GoQuota | null,
+	goQuotaFailed: boolean,
+	goAuthExpired = false,
+): string {
 	const parts: string[] = [];
 	if (goQuota) {
 		for (const { label, window: w } of goQuotaWindowEntries(goQuota)) {
@@ -555,5 +616,6 @@ export function formatGoQuotaStatusText(goQuota: GoQuota | null, goQuotaFailed: 
 		}
 	}
 	if (parts.length > 0) return parts.join(" · ");
+	if (goAuthExpired) return "额度 ✗ 需重登";
 	return goQuotaFailed ? "额度 ✗" : "额度 —";
 }

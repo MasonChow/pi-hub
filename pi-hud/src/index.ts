@@ -27,20 +27,26 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
 	applyGoQuotaFetchResult,
 	fetchOpencodeGoQuota,
+	GO_AUTH_NOTIFY_MESSAGE,
 	goQuotaWindowEntries,
+	shouldNotifyGoAuthExpired,
 	type GoQuota,
 } from "./opencode-go.ts";
 
 // 重导出，供测试与外部直接引用
 export {
 	applyGoQuotaFetchResult,
+	classifyDashboardAuthFailure,
 	classifyGoWindowName,
 	formatGoQuotaStatusText,
+	GO_AUTH_NOTIFY_MESSAGE,
 	goQuotaWindowEntries,
 	parseOpencodeGoDashboardHtml,
 	parseOpencodeGoUsage,
 	resolveOpencodeGoQuotaConfig,
+	shouldNotifyGoAuthExpired,
 	type GoQuota,
+	type GoQuotaFetchOutcome,
 	type GoQuotaWindow,
 } from "./opencode-go.ts";
 
@@ -435,6 +441,7 @@ export default function hud(pi: ExtensionAPI) {
 	let goQuota: GoQuota | null = null;
 	let goQuotaAt = 0;
 	let goQuotaFailed = false;
+	let goAuthExpired = false; // cookie/登录页失效，需用户重登
 	let auth: AuthInfo = { kind: "none" };
 	let balance: Balance | null = null;
 	let balanceAt = 0;
@@ -518,18 +525,28 @@ export default function hud(pi: ExtensionAPI) {
 		if (Date.now() - goQuotaAt < GO_QUOTA_TTL_MS) return;
 		goQuotaAt = Date.now();
 		const apiKey = auth.kind === "api_key" ? auth.apiKey : undefined;
+		const prevAuthExpired = goAuthExpired;
 		// fetch 全链路 async（含 Chrome Keychain），不阻塞 agent 主循环
 		fetchOpencodeGoQuota({ apiKey, agentDir })
-			.then((q) => {
-				const next = applyGoQuotaFetchResult(goQuota, q);
+			.then((outcome) => {
+				const next = applyGoQuotaFetchResult(goQuota, outcome);
 				goQuota = next.goQuota;
 				goQuotaFailed = next.goQuotaFailed;
+				goAuthExpired = next.goAuthExpired;
+				if (shouldNotifyGoAuthExpired(prevAuthExpired, goAuthExpired) && ctx.hasUI) {
+					try {
+						ctx.ui.notify(GO_AUTH_NOTIFY_MESSAGE, "warning");
+					} catch {
+						/* notify 失败不影响 HUD */
+					}
+				}
 				refresh(ctx);
 			})
 			.catch(() => {
-				const next = applyGoQuotaFetchResult(goQuota, null);
+				const next = applyGoQuotaFetchResult(goQuota, { quota: null, reason: "unavailable" });
 				goQuota = next.goQuota;
 				goQuotaFailed = next.goQuotaFailed;
+				goAuthExpired = next.goAuthExpired;
 				refresh(ctx);
 			});
 	}
@@ -556,9 +573,11 @@ export default function hud(pi: ExtensionAPI) {
 			const quotaText =
 				goParts.length > 0
 					? goParts.join(t.fg("dim", " · "))
-					: goQuotaFailed
-						? t.fg("error", "额度 ✗")
-						: t.fg("dim", "额度 —");
+					: goAuthExpired
+						? t.fg("error", "额度 ✗ 需重登")
+						: goQuotaFailed
+							? t.fg("error", "额度 ✗")
+							: t.fg("dim", "额度 —");
 			seg1.push(`${t.fg("muted", "订阅")} ${quotaText}`);
 			if (goQuota?.useBalance) seg1.push(t.fg("dim", "Zen余额回落开"));
 			const sessionCost = fmtSessionCost(cnyCost, uncoveredUsd);
@@ -670,6 +689,7 @@ export default function hud(pi: ExtensionAPI) {
 		goQuota = null;
 		goQuotaAt = 0;
 		goQuotaFailed = false;
+		goAuthExpired = false;
 		maybeFetchBalance(ctx);
 		maybeFetchCodexQuota(ctx);
 		maybeFetchOpencodeGoQuota(ctx);

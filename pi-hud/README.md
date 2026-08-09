@@ -51,8 +51,12 @@ Scrape 凭据解析（**按序填缺**：已有字段不再被后面覆盖）：
 | 3 | 环境变量 | `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE`（仅补空字段） |
 | 4 | macOS Chrome 自动 | History 抽 `wrk_*`，Cookies 解 `auth`（异步，需本机已登录） |
 
-刷新失败会清掉陈旧额度并显示 `额度 ✗`（不会继续展示过期剩余）。首次读 Keychain 可能弹一次权限框。
+刷新失败会清掉陈旧额度（不会继续展示过期剩余）：
 
+- 登录态 / cookie 失效、未找到凭据 → HUD `额度 ✗ 需重登`，并 **toast 提醒**在 Chrome 打开 `opencode.ai/workspace` 重登（同一失效周期只提醒一次）
+- 其它错误（网络、解析）→ `额度 ✗`，不弹登录引导
+
+首次读 Keychain 可能弹一次系统权限框。
 ## 工作方式
 
 ```mermaid

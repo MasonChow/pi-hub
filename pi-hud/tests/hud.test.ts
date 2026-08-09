@@ -14,6 +14,7 @@ import {
 	applyGoQuotaFetchResult,
 	bar,
 	cacheHitRate,
+	classifyDashboardAuthFailure,
 	classifyGoWindowName,
 	emptyAgg,
 	exactCnyCost,
@@ -34,6 +35,7 @@ import {
 	readAuthInfo,
 	recordSubagentResults,
 	resolveOpencodeGoQuotaConfig,
+	shouldNotifyGoAuthExpired,
 	summarizeSubagents,
 	type SubagentRecord,
 } from "../src/index.ts";
@@ -415,23 +417,56 @@ test("goQuotaWindowEntries: 稳定顺序 5h/周/月", () => {
 	assert.equal(entries[0].window.usedPercent, 2);
 });
 
-test("applyGoQuotaFetchResult: 失败清陈旧，成功替换", () => {
+test("applyGoQuotaFetchResult: 失败清陈旧，成功替换，auth 标记需重登", () => {
 	const stale = { rolling: { usedPercent: 90 }, source: "dashboard" as const };
-	const fail = applyGoQuotaFetchResult(stale, null);
+	const fail = applyGoQuotaFetchResult(stale, { quota: null, reason: "unavailable" });
 	assert.equal(fail.goQuota, null);
 	assert.equal(fail.goQuotaFailed, true);
-	// 失败后 UI 不能再展示 stale
-	assert.equal(formatGoQuotaStatusText(fail.goQuota, fail.goQuotaFailed), "额度 ✗");
+	assert.equal(fail.goAuthExpired, false);
+	assert.equal(formatGoQuotaStatusText(fail.goQuota, fail.goQuotaFailed, fail.goAuthExpired), "额度 ✗");
+
+	const authFail = applyGoQuotaFetchResult(stale, { quota: null, reason: "auth_expired" });
+	assert.equal(authFail.goAuthExpired, true);
+	assert.equal(formatGoQuotaStatusText(authFail.goQuota, authFail.goQuotaFailed, authFail.goAuthExpired), "额度 ✗ 需重登");
+
+	const noCred = applyGoQuotaFetchResult(null, { quota: null, reason: "no_credentials" });
+	assert.equal(noCred.goAuthExpired, true);
 
 	const fresh = { rolling: { usedPercent: 10, resetsInSeconds: 60 }, source: "api" as const };
-	const ok = applyGoQuotaFetchResult(stale, fresh);
+	const ok = applyGoQuotaFetchResult(stale, { quota: fresh, reason: "ok" });
 	assert.equal(ok.goQuotaFailed, false);
+	assert.equal(ok.goAuthExpired, false);
 	assert.equal(ok.goQuota?.rolling?.usedPercent, 10);
-	assert.match(formatGoQuotaStatusText(ok.goQuota, ok.goQuotaFailed), /5h 剩 90%/);
+	assert.match(formatGoQuotaStatusText(ok.goQuota, ok.goQuotaFailed, ok.goAuthExpired), /5h 剩 90%/);
 });
 
 test("formatGoQuotaStatusText: 未就绪显示 —", () => {
 	assert.equal(formatGoQuotaStatusText(null, false), "额度 —");
+	assert.equal(formatGoQuotaStatusText(null, false, false), "额度 —");
+});
+
+test("classifyDashboardAuthFailure: 401/登录页/密码框 → auth_expired", () => {
+	assert.equal(classifyDashboardAuthFailure(401, "https://opencode.ai/workspace/x/go", ""), "auth_expired");
+	assert.equal(classifyDashboardAuthFailure(403, "https://opencode.ai/workspace/x/go", ""), "auth_expired");
+	assert.equal(
+		classifyDashboardAuthFailure(200, "https://opencode.ai/auth/login", "<html>welcome</html>"),
+		"auth_expired",
+	);
+	assert.equal(
+		classifyDashboardAuthFailure(200, "https://opencode.ai/workspace/x/go", '<input type="password" />'),
+		"auth_expired",
+	);
+	assert.equal(
+		classifyDashboardAuthFailure(500, "https://opencode.ai/workspace/x/go", "internal error"),
+		"unavailable",
+	);
+});
+
+test("shouldNotifyGoAuthExpired: 仅在新进入失效态时提醒一次", () => {
+	assert.equal(shouldNotifyGoAuthExpired(false, true), true);
+	assert.equal(shouldNotifyGoAuthExpired(true, true), false);
+	assert.equal(shouldNotifyGoAuthExpired(true, false), false);
+	assert.equal(shouldNotifyGoAuthExpired(false, false), false);
 });
 
 test("resolveOpencodeGoQuotaConfig: 文件优先，env 只补空字段", () => {
