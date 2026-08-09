@@ -53,7 +53,7 @@ Scrape 凭据解析（**按序填缺**：已有字段不再被后面覆盖）：
 
 刷新失败会清掉陈旧额度（不会继续展示过期剩余）：
 
-- 登录态 / cookie 失效、未找到凭据 → HUD `额度 ✗ 需重登`，并 **toast 提醒**在 Chrome 打开 `opencode.ai/workspace` 重登（同一失效周期只提醒一次）
+- 登录态 / cookie 失效、未找到凭据 → HUD `额度 ✗ 需重登`，并 **toast** 引导打开 `https://opencode.ai/auth` 重登（同一失效周期只提醒一次）。注意裸路径 `/workspace` 是 404，额度页必须是 `/workspace/{wrk_id}/go`
 - 其它错误（网络、解析）→ `额度 ✗`，不弹登录引导
 
 首次读 Keychain 可能弹一次系统权限框。

@@ -25,6 +25,8 @@ import {
 	fmtTokens,
 	fmtWindowLabel,
 	formatGoQuotaStatusText,
+	GO_AUTH_LOGIN_URL,
+	goAuthNotifyMessage,
 	goQuotaWindowEntries,
 	parseCodexUsage,
 	parseDeepseekBalance,
@@ -467,6 +469,17 @@ test("shouldNotifyGoAuthExpired: 仅在新进入失效态时提醒一次", () =>
 	assert.equal(shouldNotifyGoAuthExpired(true, true), false);
 	assert.equal(shouldNotifyGoAuthExpired(true, false), false);
 	assert.equal(shouldNotifyGoAuthExpired(false, false), false);
+});
+
+test("goAuthNotifyMessage: 用 /auth 而非 404 的 /workspace；有 wrk 时附带 /go", () => {
+	const base = goAuthNotifyMessage();
+	assert.match(base, /opencode\.ai\/auth/);
+	assert.doesNotMatch(base, /opencode\.ai\/workspace[^\w/]/);
+	assert.equal(GO_AUTH_LOGIN_URL, "https://opencode.ai/auth");
+
+	const withWs = goAuthNotifyMessage("wrk_01TEST");
+	assert.match(withWs, /opencode\.ai\/auth/);
+	assert.match(withWs, /opencode\.ai\/workspace\/wrk_01TEST\/go/);
 });
 
 test("resolveOpencodeGoQuotaConfig: 文件优先，env 只补空字段", () => {

@@ -455,10 +455,26 @@ export type GoQuotaFetchReason = "ok" | "auth_expired" | "unavailable" | "no_cre
 export interface GoQuotaFetchOutcome {
 	quota: GoQuota | null;
 	reason: GoQuotaFetchReason;
+	/** 已知 workspace 时附带，便于重登引导链到 /workspace/{id}/go */
+	workspaceId?: string;
 }
 
+/**
+ * 裸 `/workspace` 会 404；登录入口是 `/auth`，额度页要带 wrk id。
+ * @see https://opencode.ai/auth → auth.opencode.ai
+ */
+export const GO_AUTH_LOGIN_URL = "https://opencode.ai/auth";
+
 export const GO_AUTH_NOTIFY_MESSAGE =
-	"OpenCode Go 登录态失效：请在 Chrome 打开 https://opencode.ai/workspace 重新登录，额度显示会自动恢复";
+	"OpenCode Go 登录态失效：请打开 https://opencode.ai/auth 重新登录，额度显示会自动恢复";
+
+/** 组装重登 toast；有 workspaceId 时附带正确的 /go 页（裸 /workspace 是 404） */
+export function goAuthNotifyMessage(workspaceId?: string): string {
+	if (workspaceId) {
+		return `OpenCode Go 登录态失效：请打开 ${GO_AUTH_LOGIN_URL} 重新登录，再访问 https://opencode.ai/workspace/${workspaceId}/go；额度显示会自动恢复`;
+	}
+	return GO_AUTH_NOTIFY_MESSAGE;
+}
 
 /**
  * 根据 dashboard HTTP 响应判断是登录失效还是其它错误。
@@ -558,9 +574,10 @@ export async function fetchOpencodeGoQuota(opts: {
 
 	const creds = await resolveOpencodeGoCredentials(opts.agentDir, opts.env);
 	if (!creds.workspaceId || !creds.authCookie) {
-		return { quota: null, reason: "no_credentials" };
+		return { quota: null, reason: "no_credentials", workspaceId: creds.workspaceId };
 	}
-	return fetchOpencodeGoUsageDashboard(creds.workspaceId, creds.authCookie);
+	const outcome = await fetchOpencodeGoUsageDashboard(creds.workspaceId, creds.authCookie);
+	return { ...outcome, workspaceId: creds.workspaceId };
 }
 
 /**

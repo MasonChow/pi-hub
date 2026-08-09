@@ -27,7 +27,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
 	applyGoQuotaFetchResult,
 	fetchOpencodeGoQuota,
-	GO_AUTH_NOTIFY_MESSAGE,
+	goAuthNotifyMessage,
 	goQuotaWindowEntries,
 	shouldNotifyGoAuthExpired,
 	type GoQuota,
@@ -39,7 +39,9 @@ export {
 	classifyDashboardAuthFailure,
 	classifyGoWindowName,
 	formatGoQuotaStatusText,
+	GO_AUTH_LOGIN_URL,
 	GO_AUTH_NOTIFY_MESSAGE,
+	goAuthNotifyMessage,
 	goQuotaWindowEntries,
 	parseOpencodeGoDashboardHtml,
 	parseOpencodeGoUsage,
@@ -535,7 +537,7 @@ export default function hud(pi: ExtensionAPI) {
 				goAuthExpired = next.goAuthExpired;
 				if (shouldNotifyGoAuthExpired(prevAuthExpired, goAuthExpired) && ctx.hasUI) {
 					try {
-						ctx.ui.notify(GO_AUTH_NOTIFY_MESSAGE, "warning");
+						ctx.ui.notify(goAuthNotifyMessage(outcome.workspaceId), "warning");
 					} catch {
 						/* notify 失败不影响 HUD */
 					}
