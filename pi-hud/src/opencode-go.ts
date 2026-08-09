@@ -10,13 +10,19 @@
  * 2. 环境变量 OPENCODE_GO_WORKSPACE_ID / OPENCODE_GO_AUTH_COOKIE
  * 3. opencode-quota 的配置文件（若已装）
  * 4. macOS Chrome：History 里扫 workspaceId，Cookies 里解 auth（Keychain）
+ *
+ * Chrome 发现路径全部异步（execFile / Keychain），避免卡死 pi 主线程。
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 export interface GoQuotaWindow {
 	usedPercent: number;
@@ -37,6 +43,8 @@ export interface OpencodeGoQuotaConfig {
 	authCookie?: string;
 }
 
+export type GoWindowKey = "rolling" | "weekly" | "monthly";
+
 const OFFICIAL_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const DASHBOARD_UA =
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -53,6 +61,23 @@ function parseWindowFields(obj: unknown): GoQuotaWindow | undefined {
 		usedPercent: used,
 		resetsInSeconds: Number.isFinite(reset) ? reset : undefined,
 	};
+}
+
+/**
+ * 将 windows[] 项的 name/id 映射到三窗口之一。
+ * 先匹配 week/month，再 match rolling；避免 name 含 "5"/"hour" 时误伤 weekly。
+ */
+export function classifyGoWindowName(name: string): GoWindowKey | null {
+	const n = name.toLowerCase().trim();
+	if (!n) return null;
+	if (n.includes("week")) return "weekly";
+	if (n.includes("month")) return "monthly";
+	if (n.includes("roll") || n.includes("5h") || n.includes("5-hour") || n.includes("5 hour") || n === "primary") {
+		return "rolling";
+	}
+	// 仅当明确是 hour 窗口且不是其它周期时
+	if (/\bhour/.test(n) && !n.includes("week") && !n.includes("month")) return "rolling";
+	return null;
 }
 
 /**
@@ -75,10 +100,10 @@ export function parseOpencodeGoUsage(json: unknown): GoQuota | null {
 			const w = item as Record<string, unknown>;
 			const parsed = parseWindowFields(w);
 			if (!parsed) continue;
-			const name = String(w.name ?? w.id ?? w.window ?? "").toLowerCase();
-			if (name.includes("roll") || name.includes("5") || name.includes("hour")) out.rolling = parsed;
-			else if (name.includes("week")) out.weekly = parsed;
-			else if (name.includes("month")) out.monthly = parsed;
+			const key = classifyGoWindowName(String(w.name ?? w.id ?? w.window ?? ""));
+			if (key === "rolling") out.rolling = parsed;
+			else if (key === "weekly") out.weekly = parsed;
+			else if (key === "monthly") out.monthly = parsed;
 		}
 		if (typeof root.useBalance === "boolean") out.useBalance = root.useBalance;
 		return out.rolling || out.weekly || out.monthly ? out : null;
@@ -91,13 +116,13 @@ export function parseOpencodeGoUsage(json: unknown): GoQuota | null {
 	return q;
 }
 
-function matchSsrWindow(html: string, key: "rolling" | "weekly" | "monthly"): GoQuotaWindow | undefined {
-	// 字段顺序不固定：status / resetInSec / usagePercent 任意排列
+function matchSsrWindow(html: string, key: GoWindowKey): GoQuotaWindow | undefined {
+	// 字段顺序不固定：status / resetInSec / usagePercent 任意排列；允许冒号后空白
 	const rePctFirst = new RegExp(
-		`${key}Usage:\\$R\\[\\d+\\]=\\{[^}]*usagePercent:${NUM}[^}]*resetInSec:${NUM}[^}]*\\}`,
+		`${key}Usage:\\s*\\$R\\[\\d+\\]\\s*=\\s*\\{[^}]*usagePercent:\\s*${NUM}[^}]*resetInSec:\\s*${NUM}[^}]*\\}`,
 	);
 	const reResetFirst = new RegExp(
-		`${key}Usage:\\$R\\[\\d+\\]=\\{[^}]*resetInSec:${NUM}[^}]*usagePercent:${NUM}[^}]*\\}`,
+		`${key}Usage:\\s*\\$R\\[\\d+\\]\\s*=\\s*\\{[^}]*resetInSec:\\s*${NUM}[^}]*usagePercent:\\s*${NUM}[^}]*\\}`,
 	);
 	const m1 = rePctFirst.exec(html);
 	if (m1) {
@@ -153,8 +178,8 @@ function parseHumanReset(text: string): number | null {
 }
 
 /** data-slot HTML 回退解析（SSR 丢失时） */
-function parseDataSlotWindows(html: string): Partial<Record<"rolling" | "weekly" | "monthly", GoQuotaWindow>> {
-	const out: Partial<Record<"rolling" | "weekly" | "monthly", GoQuotaWindow>> = {};
+function parseDataSlotWindows(html: string): Partial<Record<GoWindowKey, GoQuotaWindow>> {
+	const out: Partial<Record<GoWindowKey, GoQuotaWindow>> = {};
 	const parts = html.split(/data-slot="usage-item"/);
 	for (let i = 1; i < parts.length; i++) {
 		const chunk = parts[i];
@@ -164,16 +189,25 @@ function parseDataSlotWindows(html: string): Partial<Record<"rolling" | "weekly"
 		const usageMatch = chunk.match(/data-slot="usage-value">[^0-9]*(\d+(?:\.\d+)?)/);
 		if (!usageMatch) continue;
 		const usedPercent = Number(usageMatch[1]);
-		const resetMatch = chunk.match(/data-slot="(reset-time|reset-now)">([\s\S]*?)<\/span>/);
-		if (!resetMatch) continue;
-		const resetContent = resetMatch[2]
-			.replace(/<!--\$-->/g, "")
-			.replace(/<!--\/-->/g, "")
-			.replace(/Resets?\s*in\s*/i, "")
-			.trim();
-		const resetsInSeconds = resetMatch[1] === "reset-now" ? 0 : parseHumanReset(resetContent);
-		if (!Number.isFinite(usedPercent) || resetsInSeconds === null) continue;
-		let key: "rolling" | "weekly" | "monthly" | null = null;
+		if (!Number.isFinite(usedPercent)) continue;
+
+		const resetNow = /data-slot="reset-now"/.test(chunk);
+		const resetMatch = chunk.match(/data-slot="reset-time">([\s\S]*?)<\/span>/);
+		let resetsInSeconds: number | undefined;
+		if (resetNow) {
+			resetsInSeconds = 0;
+		} else if (resetMatch) {
+			const resetContent = resetMatch[1]
+				.replace(/<!--\$-->/g, "")
+				.replace(/<!--\/-->/g, "")
+				.replace(/Resets?\s*in\s*/i, "")
+				.trim();
+			const parsed = parseHumanReset(resetContent);
+			// 重置文案解不出时仍保留 usedPercent（比整窗丢弃更有用）
+			resetsInSeconds = parsed === null ? undefined : parsed;
+		}
+
+		let key: GoWindowKey | null = null;
 		if (label.includes("rolling")) key = "rolling";
 		else if (label.includes("weekly")) key = "weekly";
 		else if (label.includes("monthly")) key = "monthly";
@@ -182,17 +216,12 @@ function parseDataSlotWindows(html: string): Partial<Record<"rolling" | "weekly"
 	return out;
 }
 
-/** 从 dashboard HTML 解析三窗口额度 */
+/** 从 dashboard HTML 解析三窗口额度；SSR 缺哪窗就用 data-slot 补哪窗 */
 export function parseOpencodeGoDashboardHtml(html: string): GoQuota | null {
-	let rolling = matchSsrWindow(html, "rolling");
-	let weekly = matchSsrWindow(html, "weekly");
-	let monthly = matchSsrWindow(html, "monthly");
-	if (!rolling && !weekly && !monthly) {
-		const slot = parseDataSlotWindows(html);
-		rolling = slot.rolling;
-		weekly = slot.weekly;
-		monthly = slot.monthly;
-	}
+	const slot = parseDataSlotWindows(html);
+	const rolling = matchSsrWindow(html, "rolling") ?? slot.rolling;
+	const weekly = matchSsrWindow(html, "weekly") ?? slot.weekly;
+	const monthly = matchSsrWindow(html, "monthly") ?? slot.monthly;
 	if (!rolling && !weekly && !monthly) return null;
 	return { rolling, weekly, monthly, source: "dashboard" };
 }
@@ -207,7 +236,9 @@ function readJsonObject(filePath: string): Record<string, unknown> | null {
 	return null;
 }
 
-/** 读显式配置（文件 / 环境 / opencode-quota） */
+/**
+ * 读显式配置。文件先填缺省；env 仅在对应字段仍空时补齐（与 README「后者补齐前者缺失」一致）。
+ */
 export function resolveOpencodeGoQuotaConfig(
 	agentDir = path.join(os.homedir(), ".pi", "agent"),
 	env: NodeJS.ProcessEnv = process.env,
@@ -224,15 +255,14 @@ export function resolveOpencodeGoQuotaConfig(
 		if (!obj) continue;
 		if (!out.workspaceId && typeof obj.workspaceId === "string") out.workspaceId = obj.workspaceId.trim();
 		if (!out.authCookie && typeof obj.authCookie === "string") out.authCookie = obj.authCookie.trim();
-		// 兼容 cookie / auth 字段名
 		if (!out.authCookie && typeof obj.cookie === "string") out.authCookie = obj.cookie.trim();
 		if (!out.authCookie && typeof obj.auth === "string") out.authCookie = obj.auth.trim();
 	}
 
 	const envWs = env.OPENCODE_GO_WORKSPACE_ID?.trim();
 	const envCookie = env.OPENCODE_GO_AUTH_COOKIE?.trim();
-	if (envWs) out.workspaceId = envWs;
-	if (envCookie) out.authCookie = envCookie;
+	if (!out.workspaceId && envWs) out.workspaceId = envWs;
+	if (!out.authCookie && envCookie) out.authCookie = envCookie;
 
 	return out;
 }
@@ -248,24 +278,33 @@ function chromeUserDataDirs(): string[] {
 	return dirs;
 }
 
-function withCopiedDb<T>(src: string, fn: (tmp: string) => T): T | null {
+async function withCopiedDb<T>(src: string, fn: (tmp: string) => Promise<T>): Promise<T | null> {
 	if (!fs.existsSync(src)) return null;
-	const tmp = path.join(os.tmpdir(), `pi-hud-chrome-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+	const tmp = path.join(
+		os.tmpdir(),
+		`pi-hud-chrome-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.db`,
+	);
 	try {
-		fs.copyFileSync(src, tmp);
-		return fn(tmp);
+		await fsPromises.copyFile(src, tmp);
+		// 限制临时 DB 权限（仅当前用户可读写）
+		try {
+			await fsPromises.chmod(tmp, 0o600);
+		} catch {
+			/* ignore chmod failures on odd fs */
+		}
+		return await fn(tmp);
 	} catch {
 		return null;
 	} finally {
 		try {
-			fs.unlinkSync(tmp);
+			await fsPromises.unlink(tmp);
 		} catch {
 			/* ignore */
 		}
 	}
 }
 
-function pythonSqliteB64(dbPath: string, sql: string): string | null {
+async function pythonSqliteB64(dbPath: string, sql: string): Promise<string | null> {
 	try {
 		const script = `
 import sqlite3, base64, sys
@@ -280,17 +319,18 @@ if isinstance(val, bytes):
 else:
     sys.stdout.write(str(val))
 `;
-		return execFileSync("python3", ["-c", script], {
+		const { stdout } = await execFileAsync("python3", ["-c", script], {
 			encoding: "utf8",
 			timeout: 5000,
-			stdio: ["ignore", "pipe", "ignore"],
-		}).trim();
+			maxBuffer: 2 * 1024 * 1024,
+		});
+		return stdout.trim();
 	} catch {
 		return null;
 	}
 }
 
-function pythonSqliteTextRows(dbPath: string, sql: string): string[] {
+async function pythonSqliteTextRows(dbPath: string, sql: string): Promise<string[]> {
 	try {
 		const script = `
 import sqlite3, sys
@@ -301,12 +341,12 @@ for r in rows:
     if r and r[0] is not None:
         print(r[0])
 `;
-		const out = execFileSync("python3", ["-c", script], {
+		const { stdout } = await execFileAsync("python3", ["-c", script], {
 			encoding: "utf8",
 			timeout: 5000,
-			stdio: ["ignore", "pipe", "ignore"],
+			maxBuffer: 2 * 1024 * 1024,
 		});
-		return out
+		return stdout
 			.split("\n")
 			.map((s) => s.trim())
 			.filter(Boolean);
@@ -316,81 +356,96 @@ for r in rows:
 }
 
 /** 从 Chrome History 提取最近访问的 opencode workspace id */
-export function discoverOpencodeWorkspaceIdFromChrome(): string | undefined {
+export async function discoverOpencodeWorkspaceIdFromChrome(): Promise<string | undefined> {
 	for (const dir of chromeUserDataDirs()) {
 		const hist = path.join(dir, "History");
-		const urls = withCopiedDb(hist, (tmp) =>
+		const urls = await withCopiedDb(hist, (tmp) =>
 			pythonSqliteTextRows(
 				tmp,
-				"SELECT url FROM urls WHERE url LIKE '%opencode.ai/workspace/%' ORDER BY last_visit_time DESC LIMIT 30",
+				"SELECT url FROM urls WHERE url LIKE '%://opencode.ai/workspace/%' OR url LIKE '%://www.opencode.ai/workspace/%' ORDER BY last_visit_time DESC LIMIT 30",
 			),
 		);
 		if (!urls) continue;
 		for (const url of urls) {
-			const m = url.match(/opencode\.ai\/workspace\/(wrk_[A-Za-z0-9]+)/);
+			// 锚定 host，避免 History 里假域名
+			const m = url.match(/^https?:\/\/(?:www\.)?opencode\.ai\/workspace\/(wrk_[A-Za-z0-9]+)/i);
 			if (m) return m[1];
 		}
 	}
 	return undefined;
 }
 
-function chromeSafeStoragePassword(): string | null {
+async function chromeSafeStoragePassword(): Promise<string | null> {
 	if (process.platform !== "darwin") return null;
 	try {
-		return execFileSync(
+		const { stdout } = await execFileAsync(
 			"security",
 			["find-generic-password", "-w", "-s", "Chrome Safe Storage", "-a", "Chrome"],
-			{ encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] },
-		).trim();
+			{ encoding: "utf8", timeout: 5000 },
+		);
+		return stdout.trim();
 	} catch {
 		return null;
 	}
 }
 
-/** 解密 macOS Chrome Cookie 库中的 opencode.ai auth */
-export function readChromeOpencodeAuthCookie(): string | undefined {
-	const password = chromeSafeStoragePassword();
-	if (!password) return undefined;
-	const key = crypto.pbkdf2Sync(Buffer.from(password), Buffer.from("saltysalt"), 1003, 16, "sha1");
-	const iv = Buffer.alloc(16, 0x20); // 16 spaces
+const COOKIE_SQL =
+	"SELECT encrypted_value FROM cookies WHERE name = 'auth' AND (host_key = 'opencode.ai' OR host_key = '.opencode.ai' OR host_key LIKE '%.opencode.ai') ORDER BY LENGTH(host_key) ASC LIMIT 1";
 
+function decryptChromeV10Cookie(enc: Buffer, key: Buffer): string | null {
+	if (enc.length < 4) return null;
+	const prefix = enc.subarray(0, 3).toString("utf8");
+	// macOS Chrome 经典路径是 v10 + AES-CBC；v11/v20 未支持则跳过
+	if (prefix !== "v10") return null;
+	try {
+		const iv = Buffer.alloc(16, 0x20);
+		const data = enc.subarray(3);
+		const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
+		const out = Buffer.concat([decipher.update(data), decipher.final()]);
+		const plain = out.length > 32 ? out.subarray(32).toString("utf8") : out.toString("utf8");
+		const idx = plain.indexOf("Fe26");
+		const cookie = (idx >= 0 ? plain.slice(idx) : plain).trim();
+		return cookie.length > 20 ? cookie : null;
+	} catch {
+		return null;
+	}
+}
+
+/** 解密 macOS Chrome Cookie 库中的 opencode.ai auth（异步，且仅在确有密文时读 Keychain） */
+export async function readChromeOpencodeAuthCookie(): Promise<string | undefined> {
+	const candidates: Buffer[] = [];
 	for (const dir of chromeUserDataDirs()) {
 		const cookiesPath = path.join(dir, "Cookies");
-		const b64 = withCopiedDb(cookiesPath, (tmp) =>
-			pythonSqliteB64(
-				tmp,
-				"SELECT encrypted_value FROM cookies WHERE host_key = 'opencode.ai' AND name = 'auth' LIMIT 1",
-			),
-		);
+		const b64 = await withCopiedDb(cookiesPath, (tmp) => pythonSqliteB64(tmp, COOKIE_SQL));
 		if (!b64) continue;
 		try {
-			const enc = Buffer.from(b64, "base64");
-			if (enc.length < 4) continue;
-			const prefix = enc.subarray(0, 3).toString("utf8");
-			if (prefix !== "v10" && prefix !== "v11") continue;
-			const data = enc.subarray(3);
-			const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
-			const out = Buffer.concat([decipher.update(data), decipher.final()]);
-			// Chrome 在 cookie 明文前塞 32 字节完整性前缀
-			const plain = out.length > 32 ? out.subarray(32).toString("utf8") : out.toString("utf8");
-			const idx = plain.indexOf("Fe26");
-			const cookie = (idx >= 0 ? plain.slice(idx) : plain).trim();
-			if (cookie.length > 20) return cookie;
+			candidates.push(Buffer.from(b64, "base64"));
 		} catch {
-			/* 该 profile 解不开就试下一个 */
+			/* ignore */
 		}
+	}
+	if (candidates.length === 0) return undefined;
+
+	const password = await chromeSafeStoragePassword();
+	if (!password) return undefined;
+	const key = crypto.pbkdf2Sync(Buffer.from(password), Buffer.from("saltysalt"), 1003, 16, "sha1");
+
+	for (const enc of candidates) {
+		const cookie = decryptChromeV10Cookie(enc, key);
+		if (cookie) return cookie;
 	}
 	return undefined;
 }
 
-/** 合并显式配置 + Chrome 自动发现 */
-export function resolveOpencodeGoCredentials(
+/** 合并显式配置 + Chrome 自动发现（async，不阻塞事件循环） */
+export async function resolveOpencodeGoCredentials(
 	agentDir = path.join(os.homedir(), ".pi", "agent"),
 	env: NodeJS.ProcessEnv = process.env,
-): OpencodeGoQuotaConfig {
+): Promise<OpencodeGoQuotaConfig> {
 	const cfg = resolveOpencodeGoQuotaConfig(agentDir, env);
-	if (!cfg.workspaceId) cfg.workspaceId = discoverOpencodeWorkspaceIdFromChrome();
-	if (!cfg.authCookie) cfg.authCookie = readChromeOpencodeAuthCookie();
+	if (!cfg.workspaceId) cfg.workspaceId = await discoverOpencodeWorkspaceIdFromChrome();
+	// 没有 workspace 时仍可读 cookie（配置可能只缺一边）；两边都缺再省 Keychain
+	if (!cfg.authCookie) cfg.authCookie = await readChromeOpencodeAuthCookie();
 	return cfg;
 }
 
@@ -417,7 +472,6 @@ export async function fetchOpencodeGoUsageDashboard(
 	authCookie: string,
 	timeoutMs = 10000,
 ): Promise<GoQuota | null> {
-	// cookie 值可能已带 auth= 前缀
 	const cookieHeader = authCookie.startsWith("auth=") ? authCookie : `auth=${authCookie}`;
 	const url = `https://opencode.ai/workspace/${encodeURIComponent(workspaceId)}/go`;
 	const res = await fetch(url, {
@@ -436,7 +490,7 @@ export async function fetchOpencodeGoUsageDashboard(
 
 /**
  * 查 OpenCode Go 额度：官方 API → dashboard scrape。
- * 都失败返回 null（调用方标记 ✗）。
+ * 都失败返回 null（调用方标记 ✗ 并清掉陈旧值）。
  */
 export async function fetchOpencodeGoQuota(opts: {
 	apiKey?: string;
@@ -452,13 +506,26 @@ export async function fetchOpencodeGoQuota(opts: {
 		}
 	}
 
-	const creds = resolveOpencodeGoCredentials(opts.agentDir, opts.env);
+	const creds = await resolveOpencodeGoCredentials(opts.agentDir, opts.env);
 	if (!creds.workspaceId || !creds.authCookie) return null;
 	try {
 		return await fetchOpencodeGoUsageDashboard(creds.workspaceId, creds.authCookie);
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * 应用一次 Go 额度拉取结果（纯函数，供测试与 HUD 共用）。
+ * 失败时清掉陈旧 quota，避免「失败却仍显示旧剩余」。
+ */
+export function applyGoQuotaFetchResult(
+	_prev: GoQuota | null,
+	next: GoQuota | null,
+): { goQuota: GoQuota | null; goQuotaFailed: boolean } {
+	// 刷新失败时清掉陈旧值：宁可显示 ✗，也不展示过期剩余（_prev 故意不复用）
+	if (next) return { goQuota: next, goQuotaFailed: false };
+	return { goQuota: null, goQuotaFailed: true };
 }
 
 /** 渲染用：按稳定顺序产出标签 + 窗口 */
@@ -468,4 +535,25 @@ export function goQuotaWindowEntries(q: GoQuota): Array<{ label: string; window:
 	if (q.weekly) entries.push({ label: "周", window: q.weekly });
 	if (q.monthly) entries.push({ label: "月", window: q.monthly });
 	return entries;
+}
+
+/**
+ * HUD 第 1 行 Go 额度文案片段（无 theme 时用纯文本；测试覆盖接线）。
+ * failed 且无有效窗口 → "额度 ✗"；未失败未就绪 → "额度 —"
+ */
+export function formatGoQuotaStatusText(goQuota: GoQuota | null, goQuotaFailed: boolean): string {
+	const parts: string[] = [];
+	if (goQuota) {
+		for (const { label, window: w } of goQuotaWindowEntries(goQuota)) {
+			const left = Math.max(0, 100 - w.usedPercent);
+			let s = `${label} 剩 ${left.toFixed(0)}%`;
+			if (w.resetsInSeconds !== undefined) {
+				// 不在此 fmtDuration，避免与 index 循环依赖；只给秒数供测试断言
+				s += ` (重置 ${w.resetsInSeconds}s)`;
+			}
+			parts.push(s);
+		}
+	}
+	if (parts.length > 0) return parts.join(" · ");
+	return goQuotaFailed ? "额度 ✗" : "额度 —";
 }

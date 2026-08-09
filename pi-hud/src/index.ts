@@ -25,18 +25,21 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	applyGoQuotaFetchResult,
 	fetchOpencodeGoQuota,
 	goQuotaWindowEntries,
-	parseOpencodeGoDashboardHtml,
-	parseOpencodeGoUsage,
 	type GoQuota,
 } from "./opencode-go.ts";
 
 // 重导出，供测试与外部直接引用
 export {
+	applyGoQuotaFetchResult,
+	classifyGoWindowName,
+	formatGoQuotaStatusText,
+	goQuotaWindowEntries,
 	parseOpencodeGoDashboardHtml,
 	parseOpencodeGoUsage,
-	goQuotaWindowEntries,
+	resolveOpencodeGoQuotaConfig,
 	type GoQuota,
 	type GoQuotaWindow,
 } from "./opencode-go.ts";
@@ -515,18 +518,18 @@ export default function hud(pi: ExtensionAPI) {
 		if (Date.now() - goQuotaAt < GO_QUOTA_TTL_MS) return;
 		goQuotaAt = Date.now();
 		const apiKey = auth.kind === "api_key" ? auth.apiKey : undefined;
+		// fetch 全链路 async（含 Chrome Keychain），不阻塞 agent 主循环
 		fetchOpencodeGoQuota({ apiKey, agentDir })
 			.then((q) => {
-				if (q) {
-					goQuota = q;
-					goQuotaFailed = false;
-				} else {
-					goQuotaFailed = true;
-				}
+				const next = applyGoQuotaFetchResult(goQuota, q);
+				goQuota = next.goQuota;
+				goQuotaFailed = next.goQuotaFailed;
 				refresh(ctx);
 			})
 			.catch(() => {
-				goQuotaFailed = true;
+				const next = applyGoQuotaFetchResult(goQuota, null);
+				goQuota = next.goQuota;
+				goQuotaFailed = next.goQuotaFailed;
 				refresh(ctx);
 			});
 	}

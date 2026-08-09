@@ -42,16 +42,16 @@ pi install npm:@masonchow/pi-hud
 1. **官方** `GET https://opencode.ai/zen/go/v1/usage` + Bearer API key（上游上线后自动生效）
 2. **Dashboard scrape** `https://opencode.ai/workspace/{id}/go`（当前可用）
 
-Scrape 凭据解析（后者仅补齐前者缺失字段）：
+Scrape 凭据解析（**按序填缺**：已有字段不再被后面覆盖）：
 
-| 来源 | 说明 |
-|------|------|
-| `~/.pi/agent/opencode-go-quota.json` | `{ "workspaceId", "authCookie" }` 手动覆盖 |
-| 环境变量 | `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE` |
-| opencode-quota 配置 | `~/.config/opencode/opencode-quota/opencode-go.json` |
-| macOS Chrome 自动 | History 抽 `wrk_*`，Cookies 解 `auth`（需本机已登录 opencode.ai） |
+| 顺序 | 来源 | 说明 |
+|------|------|------|
+| 1 | `~/.pi/agent/opencode-go-quota.json` | `{ "workspaceId", "authCookie" }` |
+| 2 | opencode-quota 配置 | `~/.config/opencode/opencode-quota/opencode-go.json` 等 |
+| 3 | 环境变量 | `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE`（仅补空字段） |
+| 4 | macOS Chrome 自动 | History 抽 `wrk_*`，Cookies 解 `auth`（异步，需本机已登录） |
 
-显示 `额度 ✗` 时：确认 Chrome 已登录 [opencode.ai/workspace](https://opencode.ai/workspace)，或写入上述 json。首次读 Keychain 可能弹一次权限框。
+刷新失败会清掉陈旧额度并显示 `额度 ✗`（不会继续展示过期剩余）。首次读 Keychain 可能弹一次权限框。
 
 ## 工作方式
 

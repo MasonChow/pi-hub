@@ -11,8 +11,10 @@ import { test } from "node:test";
 
 import {
 	addUsage,
+	applyGoQuotaFetchResult,
 	bar,
 	cacheHitRate,
+	classifyGoWindowName,
 	emptyAgg,
 	exactCnyCost,
 	fmtCost,
@@ -21,6 +23,7 @@ import {
 	fmtSessionCost,
 	fmtTokens,
 	fmtWindowLabel,
+	formatGoQuotaStatusText,
 	goQuotaWindowEntries,
 	parseCodexUsage,
 	parseDeepseekBalance,
@@ -30,6 +33,7 @@ import {
 	parseStepfunBalance,
 	readAuthInfo,
 	recordSubagentResults,
+	resolveOpencodeGoQuotaConfig,
 	summarizeSubagents,
 	type SubagentRecord,
 } from "../src/index.ts";
@@ -325,6 +329,16 @@ test("parseOpencodeGoUsage: windows[] 形 + 脏输入", () => {
 	assert.equal(parseOpencodeGoUsage({ rollingUsage: { usagePercent: "x" } }), null);
 });
 
+test("classifyGoWindowName: week/month 优先于 hour/5，避免误分类", () => {
+	assert.equal(classifyGoWindowName("weekly"), "weekly");
+	assert.equal(classifyGoWindowName("5-hour"), "rolling");
+	assert.equal(classifyGoWindowName("rolling"), "rolling");
+	assert.equal(classifyGoWindowName("monthly"), "monthly");
+	// 旧逻辑 name.includes("5") 会把 "week-5" 之类误判；现要求 week 先命中
+	assert.equal(classifyGoWindowName("week-5"), "weekly");
+	assert.equal(classifyGoWindowName("unknown"), null);
+});
+
 test("parseOpencodeGoDashboardHtml: SSR hydration 样本（字段顺序 status/reset/percent）", () => {
 	const html = `
 		<script>/*$*/rollingUsage:$R[35]={status:"ok",resetInSec:17577,usagePercent:8}/*$*/
@@ -367,6 +381,27 @@ test("parseOpencodeGoDashboardHtml: percent-first 顺序 + data-slot 回退", ()
 	assert.equal(parseOpencodeGoDashboardHtml("<html>no usage</html>"), null);
 });
 
+test("parseOpencodeGoDashboardHtml: SSR 缺一窗时用 data-slot 补齐，不丢已有 SSR 窗", () => {
+	const html = `
+		rollingUsage:$R[1]={usagePercent:11,resetInSec:100}
+		<div data-slot="usage-item">
+			<span data-slot="usage-label">Weekly Usage</span>
+			<span data-slot="usage-value">22%</span>
+			<span data-slot="reset-time">Resets in 1 day</span>
+		</div>
+		<div data-slot="usage-item">
+			<span data-slot="usage-label">Monthly Usage</span>
+			<span data-slot="usage-value">33%</span>
+			<span data-slot="reset-time">Resets in 2 days</span>
+		</div>
+	`;
+	const q = parseOpencodeGoDashboardHtml(html);
+	assert.ok(q);
+	assert.equal(q.rolling?.usedPercent, 11);
+	assert.equal(q.weekly?.usedPercent, 22);
+	assert.equal(q.monthly?.usedPercent, 33);
+});
+
 test("goQuotaWindowEntries: 稳定顺序 5h/周/月", () => {
 	const entries = goQuotaWindowEntries({
 		monthly: { usedPercent: 1 },
@@ -378,4 +413,47 @@ test("goQuotaWindowEntries: 稳定顺序 5h/周/月", () => {
 		["5h", "周", "月"],
 	);
 	assert.equal(entries[0].window.usedPercent, 2);
+});
+
+test("applyGoQuotaFetchResult: 失败清陈旧，成功替换", () => {
+	const stale = { rolling: { usedPercent: 90 }, source: "dashboard" as const };
+	const fail = applyGoQuotaFetchResult(stale, null);
+	assert.equal(fail.goQuota, null);
+	assert.equal(fail.goQuotaFailed, true);
+	// 失败后 UI 不能再展示 stale
+	assert.equal(formatGoQuotaStatusText(fail.goQuota, fail.goQuotaFailed), "额度 ✗");
+
+	const fresh = { rolling: { usedPercent: 10, resetsInSeconds: 60 }, source: "api" as const };
+	const ok = applyGoQuotaFetchResult(stale, fresh);
+	assert.equal(ok.goQuotaFailed, false);
+	assert.equal(ok.goQuota?.rolling?.usedPercent, 10);
+	assert.match(formatGoQuotaStatusText(ok.goQuota, ok.goQuotaFailed), /5h 剩 90%/);
+});
+
+test("formatGoQuotaStatusText: 未就绪显示 —", () => {
+	assert.equal(formatGoQuotaStatusText(null, false), "额度 —");
+});
+
+test("resolveOpencodeGoQuotaConfig: 文件优先，env 只补空字段", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hud-go-cfg-"));
+	fs.writeFileSync(
+		path.join(dir, "opencode-go-quota.json"),
+		JSON.stringify({ workspaceId: "wrk_from_file", authCookie: "cookie_from_file" }),
+	);
+	const cfg = resolveOpencodeGoQuotaConfig(dir, {
+		OPENCODE_GO_WORKSPACE_ID: "wrk_from_env",
+		OPENCODE_GO_AUTH_COOKIE: "cookie_from_env",
+	});
+	assert.equal(cfg.workspaceId, "wrk_from_file");
+	assert.equal(cfg.authCookie, "cookie_from_file");
+
+	const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "hud-go-cfg2-"));
+	const cfg2 = resolveOpencodeGoQuotaConfig(dir2, {
+		OPENCODE_GO_WORKSPACE_ID: "wrk_only_env",
+	});
+	assert.equal(cfg2.workspaceId, "wrk_only_env");
+	assert.equal(cfg2.authCookie, undefined);
+
+	fs.rmSync(dir, { recursive: true, force: true });
+	fs.rmSync(dir2, { recursive: true, force: true });
 });
