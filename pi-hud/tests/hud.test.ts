@@ -21,9 +21,12 @@ import {
 	fmtSessionCost,
 	fmtTokens,
 	fmtWindowLabel,
+	goQuotaWindowEntries,
 	parseCodexUsage,
 	parseDeepseekBalance,
 	parseMoonshotBalance,
+	parseOpencodeGoDashboardHtml,
+	parseOpencodeGoUsage,
 	parseStepfunBalance,
 	readAuthInfo,
 	recordSubagentResults,
@@ -285,4 +288,94 @@ test("recordSubagentResults: 脏 details 不入库", () => {
 	recordSubagentResults(store, { results: [] }, "c3");
 	recordSubagentResults(store, { results: ["garbage"] }, "c4");
 	assert.equal(store.size, 0);
+});
+
+// --- OpenCode Go -------------------------------------------------------------
+
+test("parseOpencodeGoUsage: PR #16513 对象形（rolling/weekly/monthly）", () => {
+	const q = parseOpencodeGoUsage({
+		useBalance: false,
+		rollingUsage: { status: "ok", resetInSec: 2520, usagePercent: 65 },
+		weeklyUsage: { status: "ok", resetInSec: 259200, usagePercent: 30 },
+		monthlyUsage: { status: "ok", resetInSec: 1728000, usagePercent: 12 },
+	});
+	assert.ok(q);
+	assert.equal(q.rolling?.usedPercent, 65);
+	assert.equal(q.rolling?.resetsInSeconds, 2520);
+	assert.equal(q.weekly?.usedPercent, 30);
+	assert.equal(q.monthly?.usedPercent, 12);
+	assert.equal(q.useBalance, false);
+	assert.equal(q.source, "api");
+});
+
+test("parseOpencodeGoUsage: windows[] 形 + 脏输入", () => {
+	const q = parseOpencodeGoUsage({
+		windows: [
+			{ name: "5-hour", usagePercent: 10, resetInSec: 100 },
+			{ name: "weekly", usagePercent: 20, resetInSec: 200 },
+			{ name: "monthly", usagePercent: 30, resetInSec: 300 },
+		],
+	});
+	assert.ok(q);
+	assert.equal(q.rolling?.usedPercent, 10);
+	assert.equal(q.weekly?.usedPercent, 20);
+	assert.equal(q.monthly?.usedPercent, 30);
+	assert.equal(parseOpencodeGoUsage(null), null);
+	assert.equal(parseOpencodeGoUsage({}), null);
+	assert.equal(parseOpencodeGoUsage({ rollingUsage: { usagePercent: "x" } }), null);
+});
+
+test("parseOpencodeGoDashboardHtml: SSR hydration 样本（字段顺序 status/reset/percent）", () => {
+	const html = `
+		<script>/*$*/rollingUsage:$R[35]={status:"ok",resetInSec:17577,usagePercent:8}/*$*/
+		weeklyUsage:$R[36]={status:"ok",resetInSec:56759,usagePercent:22}
+		monthlyUsage:$R[37]={status:"ok",resetInSec:2486823,usagePercent:41}</script>
+	`;
+	const q = parseOpencodeGoDashboardHtml(html);
+	assert.ok(q);
+	assert.equal(q.source, "dashboard");
+	assert.equal(q.rolling?.usedPercent, 8);
+	assert.equal(q.rolling?.resetsInSeconds, 17577);
+	assert.equal(q.weekly?.usedPercent, 22);
+	assert.equal(q.monthly?.usedPercent, 41);
+});
+
+test("parseOpencodeGoDashboardHtml: percent-first 顺序 + data-slot 回退", () => {
+	const ssr = `rollingUsage:$R[1]={usagePercent:50,resetInSec:3600}`;
+	const q1 = parseOpencodeGoDashboardHtml(ssr);
+	assert.equal(q1?.rolling?.usedPercent, 50);
+	assert.equal(q1?.rolling?.resetsInSeconds, 3600);
+
+	const slot = `
+		<div data-slot="usage-item">
+			<span data-slot="usage-label">Rolling Usage</span>
+			<span data-slot="usage-value">15%</span>
+			<span data-slot="reset-time">Resets in 2 hours 10 minutes</span>
+		</div>
+		<div data-slot="usage-item">
+			<span data-slot="usage-label">Weekly Usage</span>
+			<span data-slot="usage-value">40%</span>
+			<span data-slot="reset-time">Resets in 3 days</span>
+		</div>
+	`;
+	const q2 = parseOpencodeGoDashboardHtml(slot);
+	assert.ok(q2);
+	assert.equal(q2.rolling?.usedPercent, 15);
+	assert.equal(q2.rolling?.resetsInSeconds, 2 * 3600 + 10 * 60);
+	assert.equal(q2.weekly?.usedPercent, 40);
+	assert.equal(q2.weekly?.resetsInSeconds, 3 * 86400);
+	assert.equal(parseOpencodeGoDashboardHtml("<html>no usage</html>"), null);
+});
+
+test("goQuotaWindowEntries: 稳定顺序 5h/周/月", () => {
+	const entries = goQuotaWindowEntries({
+		monthly: { usedPercent: 1 },
+		rolling: { usedPercent: 2 },
+		weekly: { usedPercent: 3 },
+	});
+	assert.deepEqual(
+		entries.map((e) => e.label),
+		["5h", "周", "月"],
+	);
+	assert.equal(entries[0].window.usedPercent, 2);
 });

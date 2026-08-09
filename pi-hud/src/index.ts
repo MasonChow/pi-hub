@@ -6,6 +6,7 @@
  *   - api_key：供应商余额（有查询 API 的才显示：deepseek / kimi / stepfun）+ 本 session 已消耗成本
  *   - oauth 订阅：剩余额度（openai-codex 走 GET .../backend-api/wham/usage，
  *     token 经 AuthStorage 带锁刷新，详见下方"订阅额度"小节的注释）
+ *   - opencode-go：Go 订阅三窗口额度（5h / 周 / 月；官方 API 优先，否则 dashboard scrape）
  * - context 用量：进度条 + tokens / contextWindow（来自 ctx.getContextUsage()）
  * - agent 执行时间（累计活跃时长，运行中每秒刷新）+ token 输出速度（流式实时估算，
  *   message_end 后以真实 usage 校准）
@@ -23,6 +24,22 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	fetchOpencodeGoQuota,
+	goQuotaWindowEntries,
+	parseOpencodeGoDashboardHtml,
+	parseOpencodeGoUsage,
+	type GoQuota,
+} from "./opencode-go.ts";
+
+// 重导出，供测试与外部直接引用
+export {
+	parseOpencodeGoDashboardHtml,
+	parseOpencodeGoUsage,
+	goQuotaWindowEntries,
+	type GoQuota,
+	type GoQuotaWindow,
+} from "./opencode-go.ts";
 
 // readStoredCredential 只在实际需要读 codex token 时动态 import：
 // 顶层 import 会让 `node --test` 直接对该模块做 Node 原生 ESM 解析，而
@@ -398,7 +415,9 @@ export function summarizeSubagents(
 const WIDGET_ID = "hud";
 const BALANCE_TTL_MS = 5 * 60 * 1000;
 const CODEX_QUOTA_TTL_MS = 5 * 60 * 1000;
+const GO_QUOTA_TTL_MS = 5 * 60 * 1000;
 const STREAM_REFRESH_MS = 300;
+const OPENCODE_GO_PROVIDER = "opencode-go";
 
 export default function hud(pi: ExtensionAPI) {
 	let enabled = true;
@@ -410,6 +429,9 @@ export default function hud(pi: ExtensionAPI) {
 	let codexQuota: CodexQuota | null = null;
 	let codexQuotaAt = 0;
 	let codexQuotaFailed = false; // 上一次查询失败（渲染成 ✗，避免静默显示"—"查不出原因）
+	let goQuota: GoQuota | null = null;
+	let goQuotaAt = 0;
+	let goQuotaFailed = false;
 	let auth: AuthInfo = { kind: "none" };
 	let balance: Balance | null = null;
 	let balanceAt = 0;
@@ -417,7 +439,8 @@ export default function hud(pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | null = null;
 	let lastStreamRefresh = 0;
 
-	const authPath = path.join(os.homedir(), ".pi", "agent", "auth.json");
+	const agentDir = path.join(os.homedir(), ".pi", "agent");
+	const authPath = path.join(agentDir, "auth.json");
 
 	/**
 	 * 逐条消息各自判断能不能查到官方 CNY 价目表：能查到的精确累加进 cnyCost，
@@ -487,6 +510,27 @@ export default function hud(pi: ExtensionAPI) {
 		});
 	}
 
+	function maybeFetchOpencodeGoQuota(ctx: ExtensionContext): void {
+		if (ctx.model?.provider !== OPENCODE_GO_PROVIDER) return;
+		if (Date.now() - goQuotaAt < GO_QUOTA_TTL_MS) return;
+		goQuotaAt = Date.now();
+		const apiKey = auth.kind === "api_key" ? auth.apiKey : undefined;
+		fetchOpencodeGoQuota({ apiKey, agentDir })
+			.then((q) => {
+				if (q) {
+					goQuota = q;
+					goQuotaFailed = false;
+				} else {
+					goQuotaFailed = true;
+				}
+				refresh(ctx);
+			})
+			.catch(() => {
+				goQuotaFailed = true;
+				refresh(ctx);
+			});
+	}
+
 	function buildLines(ctx: ExtensionContext): string[] {
 		const t = ctx.ui.theme;
 		const sep = t.fg("dim", " │ ");
@@ -496,7 +540,27 @@ export default function hud(pi: ExtensionAPI) {
 		// ── 第 1 行：主 agent + 认证形态 ──
 		const modelLabel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "no model";
 		const seg1: string[] = [`${t.fg("accent", "λ")} ${t.fg("accent", modelLabel)}`];
-		if (auth.kind === "oauth") {
+		const isOpencodeGo = ctx.model?.provider === OPENCODE_GO_PROVIDER;
+		if (isOpencodeGo) {
+			// Go 是 api_key 存盘但产品是订阅三窗口，不走余额分支
+			const goParts: string[] = [];
+			for (const { label, window: w } of goQuota ? goQuotaWindowEntries(goQuota) : []) {
+				const left = Math.max(0, 100 - w.usedPercent);
+				let s = `${label} 剩 ${left.toFixed(0)}%`;
+				if (w.resetsInSeconds !== undefined) s += t.fg("dim", ` (重置 ${fmtDuration(w.resetsInSeconds * 1000)})`);
+				goParts.push(s);
+			}
+			const quotaText =
+				goParts.length > 0
+					? goParts.join(t.fg("dim", " · "))
+					: goQuotaFailed
+						? t.fg("error", "额度 ✗")
+						: t.fg("dim", "额度 —");
+			seg1.push(`${t.fg("muted", "订阅")} ${quotaText}`);
+			if (goQuota?.useBalance) seg1.push(t.fg("dim", "Zen余额回落开"));
+			const sessionCost = fmtSessionCost(cnyCost, uncoveredUsd);
+			if (sessionCost !== null) seg1.push(`本次 ${t.fg("warning", sessionCost)}`);
+		} else if (auth.kind === "oauth") {
 			const quotaParts: string[] = [];
 			if (codexQuota?.primary) {
 				const q = codexQuota.primary;
@@ -517,8 +581,11 @@ export default function hud(pi: ExtensionAPI) {
 						: t.fg("dim", "额度 —");
 			seg1.push(`${t.fg("muted", "订阅")} ${quotaText}`);
 		} else {
-			if (auth.kind === "api_key") {
-				seg1.push(`${t.fg("muted", "API")} 余额 ${balance ? t.fg("success", fmtMoney(balance.amount, balance.currency)) : t.fg("dim", "—")}`);
+			// 只有在 BALANCE_APIS 里登记过的才显示余额栏，避免 opencode-go 之类误导成「余额 —」
+			if (auth.kind === "api_key" && ctx.model?.provider && BALANCE_APIS[ctx.model.provider]) {
+				seg1.push(
+					`${t.fg("muted", "API")} 余额 ${balance ? t.fg("success", fmtMoney(balance.amount, balance.currency)) : t.fg("dim", "—")}`,
+				);
 			}
 			const sessionCost = fmtSessionCost(cnyCost, uncoveredUsd);
 			if (sessionCost !== null) seg1.push(`本次 ${t.fg("warning", sessionCost)}`);
@@ -586,6 +653,7 @@ export default function hud(pi: ExtensionAPI) {
 		if (ctx.model) auth = readAuthInfo(authPath, ctx.model.provider);
 		maybeFetchBalance(ctx);
 		maybeFetchCodexQuota(ctx);
+		maybeFetchOpencodeGoQuota(ctx);
 		refresh(ctx);
 	});
 
@@ -596,8 +664,12 @@ export default function hud(pi: ExtensionAPI) {
 		codexQuota = null;
 		codexQuotaAt = 0;
 		codexQuotaFailed = false;
+		goQuota = null;
+		goQuotaAt = 0;
+		goQuotaFailed = false;
 		maybeFetchBalance(ctx);
 		maybeFetchCodexQuota(ctx);
+		maybeFetchOpencodeGoQuota(ctx);
 		refresh(ctx);
 	});
 
@@ -620,6 +692,7 @@ export default function hud(pi: ExtensionAPI) {
 		stopTimer();
 		maybeFetchBalance(ctx);
 		maybeFetchCodexQuota(ctx);
+		maybeFetchOpencodeGoQuota(ctx);
 		refresh(ctx);
 	});
 
