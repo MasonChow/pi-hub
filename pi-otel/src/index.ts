@@ -46,6 +46,7 @@ import {
 } from "./interventions.ts";
 import { createEventLogger, type EventLogger } from "./logs.ts";
 import { createMetrics, mergeAttrs, type PiMetrics } from "./metrics.ts";
+import { createSessionSummary, type SessionSummary } from "./summary.ts";
 import {
 	buildResource,
 	guard,
@@ -112,14 +113,41 @@ export function createPiOtel(
 		let traces: TraceManager | undefined;
 		let logs: EventLogger | undefined;
 		let sessionState: SessionState | undefined;
+		let summary: SessionSummary | undefined;
 		/** Mutable metric dimensions (model / provider / thinking level). */
 		let dims: Record<string, string> = {};
+		/**
+		 * `dims` snapshotted when the request payload was handed to the
+		 * provider, so a mid-flight model / thinking-level switch cannot
+		 * re-attribute the response that was already in the air.
+		 */
+		let requestDims: Record<string, string> | undefined;
+		/**
+		 * `requestDims` of the turn's most recent request, kept until the
+		 * turn ends. Turn-scoped metrics use it so a mid-turn model switch
+		 * cannot label a turn with a model that did none of its work — the
+		 * turn's phases and its tokens then carry the same model, which is
+		 * what makes the two joinable per turn.
+		 */
+		let turnRequestDims: Record<string, string> | undefined;
 		let inputCount = 0;
 		let busyStartedAt: number | undefined;
 		let busyAccumMs = 0;
 		let turnStartedAt: number | undefined;
 		let llmT0: number | undefined;
 		let llmFirstChunkAt: number | undefined;
+		/** Per-turn phase accumulators, reset at every `turn_start`. */
+		let phaseMs = { ttft: 0, streaming: 0, tool: 0 };
+		/**
+		 * Start of the currently open tool-busy window, or undefined when no
+		 * tool is running. Tools run in parallel, so busy time is measured
+		 * over this single window — opened when `toolStarts` goes from empty
+		 * to non-empty and closed when it drains — rather than summed per
+		 * tool, which would double-count the overlap. `toolStarts` is the
+		 * only in-flight bookkeeping: a separate counter could drift away
+		 * from it on a stray or duplicate event.
+		 */
+		let toolBusyStartedAt: number | undefined;
 		const toolStarts = new Map<string, { toolName: string; startedAt: number }>();
 
 		function resetSession(): void {
@@ -128,14 +156,49 @@ export function createPiOtel(
 			traces = undefined;
 			logs = undefined;
 			sessionState = undefined;
+			summary = undefined;
 			dims = {};
+			requestDims = undefined;
+			turnRequestDims = undefined;
 			inputCount = 0;
 			busyStartedAt = undefined;
 			busyAccumMs = 0;
 			turnStartedAt = undefined;
 			llmT0 = undefined;
 			llmFirstChunkAt = undefined;
+			phaseMs = { ttft: 0, streaming: 0, tool: 0 };
+			endToolBusyWindow();
+		}
+
+		/** Forget any open tool window; the tools themselves are gone too. */
+		function endToolBusyWindow(): void {
 			toolStarts.clear();
+			toolBusyStartedAt = undefined;
+		}
+
+		/**
+		 * Emit the additive turn breakdown: the four phases always sum to
+		 * exactly `turnMs`, so stacking them is a true decomposition.
+		 *
+		 * `wait` is the remainder — hooks, harness work, and time the turn
+		 * sat idle. A tool still running at the boundary contributes its
+		 * elapsed part here and keeps counting into the next turn; a request
+		 * that started before this turn can still hand it more measured time
+		 * than the turn itself lasted, so the measured phases are scaled back
+		 * to fit rather than allowed to overflow into a negative `wait`.
+		 */
+		function recordTurnPhases(turnMs: number, attrs: Record<string, string>): void {
+			const now = Date.now();
+			if (toolStarts.size > 0 && toolBusyStartedAt !== undefined) {
+				phaseMs.tool += now - toolBusyStartedAt;
+				toolBusyStartedAt = now;
+			}
+			const measured = phaseMs.ttft + phaseMs.streaming + phaseMs.tool;
+			const scale = measured > turnMs && measured > 0 ? turnMs / measured : 1;
+			metrics?.recordTurnPhase("ttft", phaseMs.ttft * scale, attrs);
+			metrics?.recordTurnPhase("streaming", phaseMs.streaming * scale, attrs);
+			metrics?.recordTurnPhase("tool", phaseMs.tool * scale, attrs);
+			metrics?.recordTurnPhase("wait", Math.max(0, turnMs - measured * scale), attrs);
 		}
 
 		function costOverrideFor(modelId: string): ModelCostOverride | undefined {
@@ -170,6 +233,7 @@ export function createPiOtel(
 			const kind = classify(signal);
 			if (kind === null) return;
 			metrics?.recordIntervention(kind, dims);
+			summary?.addIntervention(kind);
 			logs?.intervention({ kind, source: signal.source });
 		}
 
@@ -289,6 +353,7 @@ export function createPiOtel(
 				});
 				handles = initOtel(await buildResource(attrs), options);
 				metrics = createMetrics(handles.meter);
+				summary = createSessionSummary(Date.now());
 				const currentMetrics = metrics;
 				traces = createTraceManager(handles.tracer, sessionState, {
 					stateFilePath,
@@ -330,6 +395,25 @@ export function createPiOtel(
 			"session_shutdown",
 			guard(async (_event: SessionShutdownEvent) => {
 				traces?.endSession();
+				// Quitting mid-run: the agent never settled, so fold the
+				// unsettled busy stretch in before totalling.
+				if (busyStartedAt !== undefined) {
+					busyAccumMs += Date.now() - busyStartedAt;
+					busyStartedAt = undefined;
+				}
+				if (busyAccumMs > 0) {
+					summary?.addBusyMs(busyAccumMs);
+					busyAccumMs = 0;
+				}
+				if (summary !== undefined) {
+					logs?.sessionSummary({
+						sessionId: sessionState?.sessionId,
+						totals: summary.attributes(Date.now()),
+					});
+					// One summary per session: a second shutdown would emit a
+					// duplicate row with a drifted duration.
+					summary = undefined;
+				}
 				logs?.sessionShutdown({ sessionId: sessionState?.sessionId });
 				await handles?.forceFlushAll();
 			}),
@@ -341,10 +425,24 @@ export function createPiOtel(
 			"session_compact",
 			guard((event: SessionCompactEvent) => {
 				const entry = event.compactionEntry;
+				// pi does not say which model ran the compaction, so the
+				// session's current one is the best available attribution —
+				// and it has to go through the same cost override as
+				// message_end, or a costTable deployment reports compaction
+				// spend at pi's public prices while everything else is
+				// overridden.
+				const model = dims[ATTR_AI_MODEL] ?? "";
+				const usage =
+					entry.usage === undefined
+						? undefined
+						: withCostOverride(entry.usage, model);
 				metrics?.recordCompaction(
-					{ tokensBefore: entry.tokensBefore, reason: event.reason, usage: entry.usage },
+					{ tokensBefore: entry.tokensBefore, reason: event.reason, usage },
 					dims,
 				);
+				// No model is passed on: `pi.summary.models` lists the models
+				// that answered, and pi does not say which one compacted.
+				if (usage !== undefined) summary?.addUsage(usage);
 				logs?.sessionCompact({
 					sessionId: sessionState?.sessionId,
 					reason: event.reason,
@@ -383,8 +481,13 @@ export function createPiOtel(
 				}
 				if (busyAccumMs > 0) {
 					metrics?.recordAgentDuration(busyAccumMs, dims);
+					summary?.addBusyMs(busyAccumMs);
 					busyAccumMs = 0;
 				}
+				// The agent is idle, so nothing can still be executing: drop
+				// any start whose end never arrived instead of letting it hold
+				// the busy window open for the rest of the session.
+				endToolBusyWindow();
 				const text = lastAssistantText(ctx);
 				if (text !== undefined) {
 					handleSignal({ source: "question", lastAssistantText: text });
@@ -396,6 +499,10 @@ export function createPiOtel(
 			"turn_start",
 			guard((event: TurnStartEvent) => {
 				turnStartedAt = event.timestamp;
+				// Only the accumulators reset: a tool still running keeps its
+				// window open so its time lands in the turn it runs through.
+				phaseMs = { ttft: 0, streaming: 0, tool: 0 };
+				turnRequestDims = undefined;
 				traces?.startTurn(event.turnIndex, event.timestamp);
 			}),
 		);
@@ -403,11 +510,18 @@ export function createPiOtel(
 		pi.on(
 			"turn_end",
 			guard((_event: TurnEndEvent, ctx: ExtensionContext) => {
-				metrics?.recordTurn(dims);
+				// Turn-scoped metrics carry the model that did the turn's
+				// work, not whatever is selected once it is over.
+				const turnAttrs = turnRequestDims ?? dims;
+				metrics?.recordTurn(turnAttrs);
+				summary?.addTurn();
 				if (turnStartedAt !== undefined) {
-					metrics?.recordTurnDuration(Date.now() - turnStartedAt, dims);
+					const turnMs = Date.now() - turnStartedAt;
+					metrics?.recordTurnDuration(turnMs, turnAttrs);
+					recordTurnPhases(turnMs, turnAttrs);
 					turnStartedAt = undefined;
 				}
+				phaseMs = { ttft: 0, streaming: 0, tool: 0 };
 				traces?.endTurn();
 				sampleContext(ctx);
 			}),
@@ -419,6 +533,8 @@ export function createPiOtel(
 			guard((_event: BeforeProviderRequestEvent) => {
 				llmT0 = Date.now();
 				llmFirstChunkAt = undefined;
+				requestDims = { ...dims };
+				turnRequestDims = requestDims;
 				traces?.startLlmRequest();
 			}),
 		);
@@ -439,7 +555,9 @@ export function createPiOtel(
 				if (llmFirstChunkAt === undefined) {
 					llmFirstChunkAt = Date.now();
 					if (llmT0 !== undefined) {
-						metrics?.recordTtft(llmFirstChunkAt - llmT0, dims);
+						const ttft = llmFirstChunkAt - llmT0;
+						metrics?.recordTtft(ttft, requestDims ?? dims);
+						phaseMs.ttft += Math.max(0, ttft);
 					}
 				}
 			}),
@@ -452,19 +570,31 @@ export function createPiOtel(
 				const message = event.message;
 				if (message.role !== "assistant") return;
 				const now = Date.now();
-				const attrs = mergeAttrs(dims, {
+				const attrs = mergeAttrs(requestDims ?? dims, {
 					[ATTR_AI_MODEL]: message.model,
 					[ATTR_AI_PROVIDER]: message.provider,
 				});
-				metrics?.recordUsage(withCostOverride(message.usage, message.model), attrs);
+				const usage = withCostOverride(message.usage, message.model);
+				metrics?.recordUsage(usage, attrs);
+				summary?.addUsage(usage, message.model);
 				if (llmT0 !== undefined) {
 					metrics?.recordLlmDuration(now - llmT0, attrs);
 				}
 				if (llmFirstChunkAt !== undefined) {
-					metrics?.recordStreamingDuration(now - llmFirstChunkAt, attrs);
+					const streamingMs = now - llmFirstChunkAt;
+					metrics?.recordStreamingDuration(streamingMs, attrs);
+					phaseMs.streaming += Math.max(0, streamingMs);
+				} else if (llmT0 !== undefined) {
+					// Deferred or non-streamed response: no chunk ever arrived,
+					// so the whole request was time waiting on the model. It
+					// counts as `ttft` for the phase split (otherwise model
+					// latency would masquerade as idle `wait`), but not as a
+					// `pi.llm.ttft` sample — there was no first chunk to time.
+					phaseMs.ttft += Math.max(0, now - llmT0);
 				}
 				llmT0 = undefined;
 				llmFirstChunkAt = undefined;
+				requestDims = undefined;
 				traces?.endLlmRequest(message);
 				if (message.stopReason === "aborted") {
 					handleSignal({ source: "abort", message });
@@ -479,9 +609,11 @@ export function createPiOtel(
 		pi.on(
 			"tool_execution_start",
 			guard((event: ToolExecutionStartEvent) => {
+				const startedAt = Date.now();
+				if (toolStarts.size === 0) toolBusyStartedAt = startedAt;
 				toolStarts.set(event.toolCallId, {
 					toolName: event.toolName,
-					startedAt: Date.now(),
+					startedAt,
 				});
 				traces?.startTool(event.toolCallId, event.toolName);
 			}),
@@ -492,12 +624,20 @@ export function createPiOtel(
 			guard((event: ToolExecutionEndEvent) => {
 				const started = toolStarts.get(event.toolCallId);
 				toolStarts.delete(event.toolCallId);
+				const endedAt = Date.now();
+				// Only an end that closes a tracked start may close the busy
+				// window: a stray or replayed end would otherwise end it early
+				// and drop the remaining tools' time.
 				if (started !== undefined) {
 					metrics?.recordToolDuration(
-						Date.now() - started.startedAt,
+						endedAt - started.startedAt,
 						{ toolName: event.toolName, isError: event.isError },
 						dims,
 					);
+					if (toolStarts.size === 0 && toolBusyStartedAt !== undefined) {
+						phaseMs.tool += endedAt - toolBusyStartedAt;
+						toolBusyStartedAt = undefined;
+					}
 				}
 				traces?.endTool(event.toolCallId, event.isError);
 				if (event.isError) {

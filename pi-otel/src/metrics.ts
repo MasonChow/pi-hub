@@ -22,8 +22,16 @@ import {
 	ATTR_TOKEN_TYPE,
 	ATTR_TOOL_IS_ERROR,
 	ATTR_TOOL_NAME,
+	ATTR_TURN_PHASE,
 } from "./attrs.ts";
 import type { InterventionKind } from "./types.ts";
+
+/**
+ * Additive decomposition of a turn: model latency before the first chunk,
+ * streaming, tool execution, and everything left over (queueing, hook and
+ * harness work, waiting on the user mid-turn).
+ */
+export type TurnPhase = "ttft" | "streaming" | "tool" | "wait";
 
 // --- metric names ---
 
@@ -33,6 +41,7 @@ export const METRIC_HUMAN_INTERVENTIONS = "pi.human.interventions";
 export const METRIC_TURNS = "pi.turns";
 export const METRIC_AGENT_DURATION = "pi.agent.duration";
 export const METRIC_TURN_DURATION = "pi.turn.duration";
+export const METRIC_TURN_PHASE_DURATION = "pi.turn.phase.duration";
 export const METRIC_LLM_DURATION = "pi.llm.duration";
 export const METRIC_TOOL_DURATION = "pi.tool.duration";
 export const METRIC_LLM_TTFT = "pi.llm.ttft";
@@ -98,6 +107,7 @@ export interface PiMetricsInstruments {
 	turns: Counter;
 	agentDuration: Histogram;
 	turnDuration: Histogram;
+	turnPhaseDuration: Histogram;
 	llmDuration: Histogram;
 	toolDuration: Histogram;
 	llmTtft: Histogram;
@@ -132,6 +142,12 @@ export interface PiMetrics {
 	recordTurn(attrs?: Attributes): void;
 	recordAgentDuration(ms: number, attrs?: Attributes): void;
 	recordTurnDuration(ms: number, attrs?: Attributes): void;
+	/**
+	 * One phase slice of a finished turn. The four phases are recorded
+	 * together at `turn_end` and sum to that turn's `pi.turn.duration`, so
+	 * stacking them answers "where did the time go".
+	 */
+	recordTurnPhase(phase: TurnPhase, ms: number, attrs?: Attributes): void;
 	recordLlmDuration(ms: number, attrs?: Attributes): void;
 	recordToolDuration(
 		ms: number,
@@ -166,7 +182,8 @@ export interface PiMetrics {
 	recordDropped(count?: number, attrs?: Attributes): void;
 }
 
-const TOKEN_FIELDS: ReadonlyArray<
+/** Token breakdown of one `usage`; shared with the session summary. */
+export const TOKEN_FIELDS: ReadonlyArray<
 	readonly [TokenType, (usage: Usage) => number | undefined]
 > = [
 	["input", (u) => u.input],
@@ -177,7 +194,8 @@ const TOKEN_FIELDS: ReadonlyArray<
 	["reasoning", (u) => u.reasoning],
 ];
 
-const COST_FIELDS: ReadonlyArray<
+/** Cost breakdown of one `usage`; components sum to `usage.cost.total`. */
+export const COST_FIELDS: ReadonlyArray<
 	readonly [TokenType, (usage: Usage) => number]
 > = [
 	["input", (u) => u.cost.input],
@@ -216,6 +234,11 @@ export function createMetrics(meter: Meter): PiMetrics {
 	});
 	const turnDuration = meter.createHistogram(METRIC_TURN_DURATION, {
 		description: "Single turn duration",
+		unit: "ms",
+	});
+	const turnPhaseDuration = meter.createHistogram(METRIC_TURN_PHASE_DURATION, {
+		description:
+			"Turn time split into ttft | streaming | tool | wait; the four phases sum to the turn duration",
 		unit: "ms",
 	});
 	const llmDuration = meter.createHistogram(METRIC_LLM_DURATION, {
@@ -308,6 +331,7 @@ export function createMetrics(meter: Meter): PiMetrics {
 			turns,
 			agentDuration,
 			turnDuration,
+			turnPhaseDuration,
 			llmDuration,
 			toolDuration,
 			llmTtft,
@@ -334,6 +358,13 @@ export function createMetrics(meter: Meter): PiMetrics {
 		},
 		recordTurnDuration(ms, attrs) {
 			recordDurationTo(turnDuration, ms, attrs);
+		},
+		recordTurnPhase(phase, ms, attrs) {
+			recordDurationTo(
+				turnPhaseDuration,
+				ms,
+				mergeAttrs(attrs, { [ATTR_TURN_PHASE]: phase }),
+			);
 		},
 		recordLlmDuration(ms, attrs) {
 			recordDurationTo(llmDuration, ms, attrs);
