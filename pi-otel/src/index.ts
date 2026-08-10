@@ -389,6 +389,9 @@ export function createPiOtel(
 						sessionId: sessionState?.sessionId,
 						totals: summary.attributes(Date.now()),
 					});
+					// One summary per session: a second shutdown would emit a
+					// duplicate row with a drifted duration.
+					summary = undefined;
 				}
 				logs?.sessionShutdown({ sessionId: sessionState?.sessionId });
 				await handles?.forceFlushAll();
@@ -401,13 +404,22 @@ export function createPiOtel(
 			"session_compact",
 			guard((event: SessionCompactEvent) => {
 				const entry = event.compactionEntry;
+				// pi does not say which model ran the compaction, so the
+				// session's current one is the best available attribution —
+				// and it has to go through the same cost override as
+				// message_end, or a costTable deployment reports compaction
+				// spend at pi's public prices while everything else is
+				// overridden.
+				const model = dims[ATTR_AI_MODEL] ?? "";
+				const usage =
+					entry.usage === undefined
+						? undefined
+						: withCostOverride(entry.usage, model);
 				metrics?.recordCompaction(
-					{ tokensBefore: entry.tokensBefore, reason: event.reason, usage: entry.usage },
+					{ tokensBefore: entry.tokensBefore, reason: event.reason, usage },
 					dims,
 				);
-				if (entry.usage !== undefined) {
-					summary?.addUsage(entry.usage, dims[ATTR_AI_MODEL]);
-				}
+				if (usage !== undefined) summary?.addUsage(usage, model);
 				logs?.sessionCompact({
 					sessionId: sessionState?.sessionId,
 					reason: event.reason,
@@ -573,18 +585,21 @@ export function createPiOtel(
 				const started = toolStarts.get(event.toolCallId);
 				toolStarts.delete(event.toolCallId);
 				const endedAt = Date.now();
+				// Only an end that closes a tracked start may move the busy
+				// counter: a stray or replayed end would otherwise close the
+				// window early and drop the remaining tools' time.
 				if (started !== undefined) {
 					metrics?.recordToolDuration(
 						endedAt - started.startedAt,
 						{ toolName: event.toolName, isError: event.isError },
 						dims,
 					);
-				}
-				if (toolsInFlight > 0) {
-					toolsInFlight -= 1;
-					if (toolsInFlight === 0 && toolBusyStartedAt !== undefined) {
-						phaseMs.tool += endedAt - toolBusyStartedAt;
-						toolBusyStartedAt = undefined;
+					if (toolsInFlight > 0) {
+						toolsInFlight -= 1;
+						if (toolsInFlight === 0 && toolBusyStartedAt !== undefined) {
+							phaseMs.tool += endedAt - toolBusyStartedAt;
+							toolBusyStartedAt = undefined;
+						}
 					}
 				}
 				traces?.endTool(event.toolCallId, event.isError);

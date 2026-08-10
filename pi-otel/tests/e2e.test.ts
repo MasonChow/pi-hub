@@ -23,6 +23,7 @@ import {
 import { InMemoryLogRecordExporter } from "@opentelemetry/sdk-logs";
 import type { Usage } from "@earendil-works/pi-ai";
 import {
+	ATTR_AI_MODEL,
 	ATTR_AI_RESPONSE_STOP_REASON,
 	ATTR_AI_STREAM_TIME_TO_FIRST_CHUNK_MS,
 	ATTR_INTERVENTION_KIND,
@@ -42,6 +43,7 @@ import {
 	METRIC_HUMAN_INTERVENTIONS,
 	METRIC_LLM_TTFT,
 	METRIC_TOKENS,
+	METRIC_TOOL_DURATION,
 	METRIC_TURN_DURATION,
 	METRIC_TURN_PHASE_DURATION,
 	METRIC_TURNS,
@@ -459,5 +461,141 @@ test("full session replay through the extension entry", async (t) => {
 		assert.ok(commands.includes("req"));
 		const state = readStateFile(stateFile);
 		assert.ok(state.lastTraceByRequirement["REQ-E2E"] !== undefined);
+	});
+});
+
+const sleep = (ms: number): Promise<void> =>
+	new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The two behaviors the phase/snapshot work exists for, which the replay
+ * above cannot reach: it runs one tool at a time and never switches model
+ * mid-request. Real elapsed time is used (with wide margins) because both
+ * invariants are about wall-clock bookkeeping.
+ */
+test("overlapping tools collapse into one busy window; a mid-flight model switch does not re-attribute the request", async (t) => {
+	delete process.env["PI_REQUIREMENT_ID"];
+	delete process.env["OTEL_SDK_DISABLED"];
+	delete process.env["PI_OTEL_DISABLED"];
+
+	const dir = mkdtempSync(join(tmpdir(), "pi-otel-phases-"));
+	const stateFile = join(dir, "state.json");
+	const cwd = join(dir, "project");
+
+	const metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+	const spanExporter = new InMemorySpanExporter();
+	const logExporter = new InMemoryLogRecordExporter();
+
+	const { host, handlers } = createHost();
+	createPiOtel({
+		stateFilePath: stateFile,
+		exporters: { metrics: metricExporter, traces: spanExporter, logs: logExporter },
+	})(host);
+
+	const ctx = createCtx(cwd);
+	const fire = async (event: string, payload: Record<string, unknown>): Promise<void> => {
+		for (const handler of handlers.get(event) ?? []) {
+			await handler(payload, ctx);
+		}
+	};
+
+	await fire("session_start", { type: "session_start", reason: "startup" });
+	await fire("agent_start", { type: "agent_start" });
+	await fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+
+	// Request goes out on claude-test; the user switches model while it is
+	// still streaming.
+	await fire("before_provider_request", { type: "before_provider_request", payload: {} });
+	const assistant = assistantMessage("toolUse", usage1);
+	await fire("message_start", { type: "message_start", message: assistant });
+	await sleep(20);
+	await fire("message_update", {
+		type: "message_update",
+		message: assistant,
+		assistantMessageEvent: { type: "text_delta" },
+	});
+	await fire("model_select", {
+		type: "model_select",
+		model: { id: "claude-next", provider: "anthropic" },
+		previousModel: { id: "claude-test" },
+		source: "set",
+	});
+	await fire("message_end", { type: "message_end", message: assistant });
+
+	// Two tools overlap: t0 start A, t40 start B, t80 end A, t120 end B.
+	// Union window = ~120ms, sum of durations = ~160ms.
+	const startTool = (id: string): Promise<void> =>
+		fire("tool_execution_start", {
+			type: "tool_execution_start",
+			toolCallId: id,
+			toolName: "bash",
+			args: {},
+		});
+	const endTool = (id: string): Promise<void> =>
+		fire("tool_execution_end", {
+			type: "tool_execution_end",
+			toolCallId: id,
+			toolName: "bash",
+			result: {},
+			isError: false,
+		});
+
+	await startTool("call-a");
+	await sleep(40);
+	await startTool("call-b");
+	// A stray end for a tool that never started must not move the counter:
+	// if it does, the window closes at call-a's end and call-b's remaining
+	// time is lost.
+	await endTool("call-unknown");
+	await sleep(40);
+	await endTool("call-a");
+	await sleep(40);
+	await endTool("call-b");
+
+	await fire("turn_end", { type: "turn_end", turnIndex: 0, message: assistant, toolResults: [] });
+	await fire("agent_end", { type: "agent_end", messages: [] });
+	await fire("agent_settled", { type: "agent_settled" });
+	await fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+
+	const batches = metricExporter.getMetrics();
+	const batch = batches[batches.length - 1];
+
+	await t.test("tool phase is the union of the overlap, not the sum", () => {
+		const phases = metricByName(batch, METRIC_TURN_PHASE_DURATION);
+		const toolPhase = phases.dataPoints.find(
+			(p) => p.attributes[ATTR_TURN_PHASE] === "tool",
+		);
+		assert.ok(toolPhase !== undefined && typeof toolPhase.value === "object");
+		const phaseMs = toolPhase.value.sum ?? 0;
+
+		let durationSum = 0;
+		for (const point of metricByName(batch, METRIC_TOOL_DURATION).dataPoints) {
+			if (typeof point.value === "object") durationSum += point.value.sum ?? 0;
+		}
+
+		// Both tools ran ~80ms each; overlapping, they occupied ~120ms.
+		assert.ok(durationSum >= 140, `expected both tool durations, got ${durationSum}ms`);
+		assert.ok(phaseMs >= 100, `union window too short: ${phaseMs}ms`);
+		assert.ok(
+			phaseMs < durationSum - 20,
+			`overlap not collapsed: phase ${phaseMs}ms vs sum ${durationSum}ms`,
+		);
+	});
+
+	await t.test("in-flight request keeps the model it was sent with", () => {
+		const ttft = metricByName(batch, METRIC_LLM_TTFT);
+		const models = ttft.dataPoints.map((p) => p.attributes[ATTR_AI_MODEL]);
+		assert.deepEqual(models, ["claude-test"]);
+
+		const tokens = metricByName(batch, METRIC_TOKENS);
+		for (const point of tokens.dataPoints) {
+			assert.equal(point.attributes[ATTR_AI_MODEL], "claude-test");
+		}
+	});
+
+	await t.test("the switch still applies to what comes after the request", () => {
+		const turns = metricByName(batch, METRIC_TURNS);
+		const models = turns.dataPoints.map((p) => p.attributes[ATTR_AI_MODEL]);
+		assert.deepEqual(models, ["claude-next"]);
 	});
 });

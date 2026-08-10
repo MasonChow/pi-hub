@@ -35,7 +35,12 @@ export interface SessionSummary {
 	addIntervention(kind: InterventionKind): void;
 	addTurn(): void;
 	addBusyMs(ms: number): void;
-	/** Totals as flat log attributes; zero-valued series are omitted. */
+	/**
+	 * Totals as flat log attributes. The five session totals (duration,
+	 * turns, busy time, cost total, intervention total) are always present,
+	 * including at zero, so a summary row has a stable shape; the per-type
+	 * token / cost / intervention series appear only when non-zero.
+	 */
 	attributes(endedAt: number): SummaryAttributes;
 }
 

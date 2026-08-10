@@ -29,7 +29,12 @@ import { BatchLogRecordProcessor, LoggerProvider } from "@opentelemetry/sdk-logs
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
-import { ATTR_PI_VERSION, ATTR_PROJECT_PATH, ATTR_SESSION_ID } from "./attrs.ts";
+import {
+	ATTR_PI_VERSION,
+	ATTR_PROJECT_PATH,
+	ATTR_SESSION_ID,
+	ATTR_SESSION_PARENT_ID,
+} from "./attrs.ts";
 import type { PiOtelOptions } from "./types.ts";
 
 const SCOPE_NAME = "pi-otel";
@@ -85,11 +90,16 @@ export async function buildResource(
 /**
  * Resource attributes dropped from metrics by default. Backends that
  * promote resource attributes to metric labels explode on per-session ids;
- * the project path follows because it is per-checkout identity, not a
- * fleet-level dimension. Traces and logs always keep the full set — that is
- * where per-session drill-down belongs.
+ * the fork parent id has the same per-session shape, and the project path
+ * follows because it is per-checkout identity, not a fleet-level dimension.
+ * Traces and logs always keep the full set — that is where per-session
+ * drill-down (and the fork lineage link) belongs.
  */
-const DEFAULT_METRICS_EXCLUDE_ATTRS = [ATTR_SESSION_ID, ATTR_PROJECT_PATH];
+const DEFAULT_METRICS_EXCLUDE_ATTRS = [
+	ATTR_SESSION_ID,
+	ATTR_SESSION_PARENT_ID,
+	ATTR_PROJECT_PATH,
+];
 
 /**
  * `PI_OTEL_METRICS_EXCLUDE_ATTRS`, comma-separated. Unset falls back to the

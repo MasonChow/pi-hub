@@ -47,7 +47,7 @@ Everything OTLP-related uses the standard `OTEL_*` environment variables consume
 | `OTEL_SDK_DISABLED` | `true`/`1`: disable all reporting |
 | `PI_OTEL_DISABLED` | `true`/`1`: disable pi-otel only (same effect, scoped name) |
 | `PI_OTEL_DEBUG` | `1`: log swallowed telemetry errors to stderr (they are silent otherwise) |
-| `PI_OTEL_METRICS_EXCLUDE_ATTRS` | Resource attributes to keep off **metrics**, comma-separated. Default `pi.session.id,pi.project.path`; set to an empty string to keep everything |
+| `PI_OTEL_METRICS_EXCLUDE_ATTRS` | Resource attributes to keep off **metrics**, comma-separated. Default `pi.session.id,pi.session.parent_id,pi.project.path`; set to an empty string to keep everything |
 | `PI_REQUIREMENT_ID` | Force the requirement id for this process (CI / scripted runs) |
 | `PI_OTEL_REQUIREMENT_BRANCH_REGEX` | Override the branch-name pattern used for requirement resolution |
 
@@ -123,13 +123,13 @@ Useful derived views: *autonomy rate* = `1 − interventions / turns`; per-requi
 
 #### Metric cardinality
 
-Many backends flatten resource attributes into metric labels, where a per-session id means a new time series per session. So `pi.session.id` and `pi.project.path` are **stripped from metrics only** — traces and logs keep the full attribute set, which is where per-session drill-down belongs, and `pi.session.summary` (below) carries the same session's totals as one log row.
+Many backends flatten resource attributes into metric labels, where a per-session id means a new time series per session. So `pi.session.id`, `pi.session.parent_id` (same per-session shape, on forks) and `pi.project.path` are **stripped from metrics only** — traces and logs keep the full attribute set, which is where per-session drill-down and the fork lineage link belong, and `pi.session.summary` (below) carries the same session's totals as one log row.
 
 Change the list with `PI_OTEL_METRICS_EXCLUDE_ATTRS` (comma-separated; empty string keeps everything):
 
 ```bash
-# keep the project path on metrics, still drop the session id
-export PI_OTEL_METRICS_EXCLUDE_ATTRS=pi.session.id
+# keep the project path on metrics, still drop the per-session ids
+export PI_OTEL_METRICS_EXCLUDE_ATTRS=pi.session.id,pi.session.parent_id
 ```
 
 ### Traces
