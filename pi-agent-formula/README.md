@@ -64,8 +64,7 @@ pi install npm:@masonchow/pi-agent-formula
 
 - 规则先估任务难度（关键词、文本长度、多文件线索 + 纠正/工具失败），再与当前模型胎强对比。
 - 可选评判模型（judge）二次裁决，可返回 `MODE: quality|economy|match`。
-- **量变**（轮次/上下文/时长）只升温，**不会单独**触发自动升档。
-- 自动省耗比质量进站更克制（更长冷却，且质量信号优先于省耗）。
+- 只在手动 `/boxbox` 时评估：会话中不自动弹建议、不自动换模。
 
 ## 命令
 
@@ -77,12 +76,11 @@ pi install npm:@masonchow/pi-agent-formula
 
 ## 适用范围
 
-✅ 手动 `/boxbox`：难度匹配升档 + 过配降档省耗
-✅ 自动：负向质量信号升档；平稳过配时省耗降档（均需确认）
+✅ 手动 `/boxbox`：难度匹配升档 + 质量升档 + 过配降档省耗（确认后 `setModel`）
 ✅ 打标时参考内置市面模型表 `src/builtin-models.json`（`power` 越大越强，`deprecated: true` 默认跳过）
 ✅ 换模成本评估（含 prompt cache 丢失说明）
-✅ 冷却机制：质量 ~15 分钟 / 5 轮；省耗 ~45 分钟 / 10 轮
 
+❌ 会话中自动识别/自动弹建议（只在 `/boxbox` 时评估）
 ❌ 自动静默换模（始终需要确认）
 ❌ 每条 prompt 发前静默路由（那是路由器产品，不是进站顾问）
 ❌ 多 profile / 按项目分别打标
@@ -101,7 +99,7 @@ sequenceDiagram
   F->>Pi: 拉取可用模型列表
   F->>F: 结合内置模型表打标
   F->>F: 落盘 formula-pit.json
-  U->>F: /boxbox 或自动信号
+  U->>F: /boxbox
   F->>F: 估任务难度 vs 当前胎强
   F->>F: 质量升档 / 省耗降档 / 匹配
   opt 有评判模型
