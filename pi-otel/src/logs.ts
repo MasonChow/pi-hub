@@ -46,6 +46,14 @@ export interface EventLogger {
 		requirementId?: string;
 	}): void;
 	sessionShutdown(info?: { sessionId?: string }): void;
+	/**
+	 * One row per session with its totals (see `summary.ts`). Emitted at
+	 * `session_shutdown`, before the final flush.
+	 */
+	sessionSummary(info: {
+		sessionId?: string;
+		totals: Record<string, string | number>;
+	}): void;
 	sessionCompact(info: {
 		sessionId?: string;
 		reason?: string;
@@ -138,6 +146,12 @@ export function createEventLogger(
 				"pi.session.shutdown",
 				"session shutdown",
 				pruned({ [ATTR_SESSION_ID]: i?.sessionId }),
+			),
+		sessionSummary: (i) =>
+			info(
+				"pi.session.summary",
+				"session summary",
+				pruned({ [ATTR_SESSION_ID]: i.sessionId, ...i.totals }),
 			),
 		sessionCompact: (i) =>
 			info(

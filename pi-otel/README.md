@@ -35,7 +35,7 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 
 ## Configuration
 
-Everything OTLP-related uses the standard `OTEL_*` environment variables consumed by the OpenTelemetry exporters — pi-otel adds no exporter configuration of its own. Transport is OTLP over HTTP.
+Everything OTLP-related uses the standard `OTEL_*` environment variables consumed by the OpenTelemetry exporters — pi-otel adds no exporter configuration of its own. Transport is OTLP over HTTP with **JSON** encoding. Gateways that only accept `http/protobuf` are served by passing the `-proto` exporters through [`PiOtelOptions.exporters`](#otlpprotobuf-gateways).
 
 | Variable | Meaning |
 | --- | --- |
@@ -47,6 +47,7 @@ Everything OTLP-related uses the standard `OTEL_*` environment variables consume
 | `OTEL_SDK_DISABLED` | `true`/`1`: disable all reporting |
 | `PI_OTEL_DISABLED` | `true`/`1`: disable pi-otel only (same effect, scoped name) |
 | `PI_OTEL_DEBUG` | `1`: log swallowed telemetry errors to stderr (they are silent otherwise) |
+| `PI_OTEL_METRICS_EXCLUDE_ATTRS` | Resource attributes to keep off **metrics**, comma-separated. Default `pi.session.id,pi.project.path`; set to an empty string to keep everything |
 | `PI_REQUIREMENT_ID` | Force the requirement id for this process (CI / scripted runs) |
 | `PI_OTEL_REQUIREMENT_BRANCH_REGEX` | Override the branch-name pattern used for requirement resolution |
 
@@ -93,9 +94,11 @@ sum by (pi_requirement_id) (increase(pi_cost_usd_total[30d]))
 
 ### Metrics
 
-All metrics carry the session's resource attributes (`pi.session.id`, `pi.requirement.id`, `pi.project.path`, plus anything your plugins add).
+All metrics carry the session's resource attributes (`pi.requirement.id` plus anything your plugins add) — see [metric cardinality](#metric-cardinality) for the two attributes held back by default.
 
-| Metric | Type | Dimensions | Meaning |
+Every metric below additionally carries the **common dimensions** `pi.ai.model`, `pi.ai.provider`, and `pi.thinking_level`, so cost, latency and intervention rate all break down by model and by thinking level. On LLM metrics the model and provider come from the response itself, and the thinking level is the one snapshotted when the request was sent.
+
+| Metric | Type | Extra dimensions | Meaning |
 | --- | --- | --- | --- |
 | `pi.tokens` | Counter | `pi.token.type` = `input` \| `output` \| `cache_read` \| `cache_write` \| `cache_write_1h` \| `reasoning` | Token consumption per LLM response |
 | `pi.cost.usd` | Counter | `pi.token.type` = `input` \| `output` \| `cache_read` \| `cache_write` | Cost in USD per component, as computed by pi's price table; components sum to the total spend |
@@ -103,10 +106,11 @@ All metrics carry the session's resource attributes (`pi.session.id`, `pi.requir
 | `pi.human.interventions` | Counter | `pi.intervention.kind` = `steer` \| `follow_up` \| `interrupt` \| `approval` \| `question` | Times a human had to come back to the session |
 | `pi.agent.duration` | Histogram | — | `agent_start → agent_settled`, real agent busy time |
 | `pi.turn.duration` | Histogram | — | Single turn duration |
-| `pi.llm.duration` | Histogram | model, provider | Single LLM request duration |
-| `pi.llm.ttft` | Histogram | model, provider | Time to first streamed chunk |
-| `pi.llm.streaming.duration` | Histogram | model, provider | First chunk → last token |
-| `pi.tool.duration` | Histogram | `pi.tool.name` | Single tool execution |
+| `pi.turn.phase.duration` | Histogram | `pi.turn.phase` = `ttft` \| `streaming` \| `tool` \| `wait` | The same turn, split into four phases that sum back to `pi.turn.duration` — stack them for "where did the time go" |
+| `pi.llm.duration` | Histogram | — | Single LLM request duration |
+| `pi.llm.ttft` | Histogram | — | Time to first streamed chunk |
+| `pi.llm.streaming.duration` | Histogram | — | First chunk → last token |
+| `pi.tool.duration` | Histogram | `pi.tool.name`, `pi.tool.is_error` | Single tool execution; the `is_error` split gives per-tool failure rate |
 | `pi.context.tokens` / `pi.context.usage_ratio` | Gauge | — | Context window usage, sampled per turn |
 | `pi.compaction` | Counter | `pi.compaction.reason`, `pi.compaction.tokens_before` | Context compactions (the compaction's own LLM usage is folded into `pi.tokens` / `pi.cost.usd`) |
 | `pi.errors` | Counter | `pi.error.scope` = `llm` \| `tool` \| `agent` \| `provider` | Runtime errors |
@@ -116,6 +120,17 @@ All metrics carry the session's resource attributes (`pi.session.id`, `pi.requir
 Useful derived views: *autonomy rate* = `1 − interventions / turns`; per-requirement busy time = `sum by (pi_requirement_id) (pi_agent_duration_sum)`.
 
 **Token accounting:** `reasoning` tokens are a **subset of `output`**, and `cache_write_1h` a subset of `cache_write` — sum `input + output + cache_read + cache_write` for totals and treat the subsets as drill-downs, or you will double-count. `pi.cost.usd` is pi's own cost computation; override pricing via a plugin `costTable` only if your proxy bills differently.
+
+#### Metric cardinality
+
+Many backends flatten resource attributes into metric labels, where a per-session id means a new time series per session. So `pi.session.id` and `pi.project.path` are **stripped from metrics only** — traces and logs keep the full attribute set, which is where per-session drill-down belongs, and `pi.session.summary` (below) carries the same session's totals as one log row.
+
+Change the list with `PI_OTEL_METRICS_EXCLUDE_ATTRS` (comma-separated; empty string keeps everything):
+
+```bash
+# keep the project path on metrics, still drop the session id
+export PI_OTEL_METRICS_EXCLUDE_ATTRS=pi.session.id
+```
 
 ### Traces
 
@@ -134,6 +149,30 @@ session (trace root)          pi.session.id, pi.requirement.id, pi.session.reaso
 ### Logs
 
 Low-frequency, high-information state changes go to the logs pipeline: session lifecycle (start/resume/fork/shutdown), model and thinking-level selection, compaction, errors, and intervention details (kind + metadata).
+
+**`pi.session.summary`** is the one row per session: emitted at `session_shutdown` (before the final flush) with the whole session's totals. It answers the questions metrics cannot once per-session attributes are off the labels — per-session distributions (interventions per session, cost per intervention bucket) and joins against other systems by session id.
+
+```jsonc
+{
+  "event.name": "pi.session.summary",
+  "attributes": {
+    "pi.session.id": "0198…",
+    "pi.summary.duration_ms": 748000,
+    "pi.summary.agent_busy_ms": 214000,
+    "pi.summary.turns": 13,
+    "pi.summary.tokens.input": 812000,       // one field per token type
+    "pi.summary.tokens.output": 64000,
+    "pi.summary.cost.input_usd": 1.21,       // one field per cost component
+    "pi.summary.cost.total_usd": 1.62,
+    "pi.summary.interventions.total": 2,
+    "pi.summary.interventions.steer": 1,     // one field per kind
+    "pi.summary.interventions.question": 1,
+    "pi.summary.models": "claude-sonnet-5"   // comma-separated, sorted
+  }
+}
+```
+
+Token and cost fields follow the same subset rules as the counters, and only non-zero series appear. Session resource attributes (`pi.requirement.id`, `pi.project.path`, plugin dimensions) are attached by the pipeline as with every other record.
 
 ### Schema alignment
 
@@ -155,6 +194,26 @@ The core knows nothing about Jira, org charts, or approval systems. Ship a thin 
 | `redact(attrs)` | With the session's resource attributes at `session_start`, before they are frozen | Dropping or masking attributes (e.g. `pi.project.path`) per privacy policy |
 
 A copy-paste skeleton with all four hooks lives in [`examples/enterprise-plugin.example.ts`](./examples/enterprise-plugin.example.ts).
+
+### OTLP/protobuf gateways
+
+The bundled exporters speak OTLP/HTTP with JSON encoding. If your gateway only accepts `http/protobuf`, depend on the `-proto` exporters in your enterprise package and pass them in — they read the same `OTEL_*` variables, so no other configuration changes:
+
+```ts
+import { createPiOtel } from "@masonchow/pi-otel";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
+import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-proto";
+
+export default createPiOtel({
+  plugins: [myPlugin],
+  exporters: {
+    traces: new OTLPTraceExporter(),
+    metrics: new OTLPMetricExporter(),
+    logs: new OTLPLogExporter(),
+  },
+});
+```
 
 ### Approval events over the pi event bus
 

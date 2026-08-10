@@ -26,10 +26,12 @@ import {
 	ATTR_AI_RESPONSE_STOP_REASON,
 	ATTR_AI_STREAM_TIME_TO_FIRST_CHUNK_MS,
 	ATTR_INTERVENTION_KIND,
+	ATTR_PROJECT_PATH,
 	ATTR_REQUIREMENT_ID,
 	ATTR_SESSION_ID,
 	ATTR_TOKEN_TYPE,
 	ATTR_TURN_INDEX,
+	ATTR_TURN_PHASE,
 	SPAN_AI_REQUEST,
 	SPAN_HARNESS_RUN,
 	SPAN_HARNESS_TOOL,
@@ -40,6 +42,8 @@ import {
 	METRIC_HUMAN_INTERVENTIONS,
 	METRIC_LLM_TTFT,
 	METRIC_TOKENS,
+	METRIC_TURN_DURATION,
+	METRIC_TURN_PHASE_DURATION,
 	METRIC_TURNS,
 } from "../src/metrics.ts";
 import { SPAN_SESSION } from "../src/traces.ts";
@@ -389,6 +393,58 @@ test("full session replay through the extension entry", async (t) => {
 			if (typeof point.value === "object") count += point.value.count;
 		}
 		assert.equal(count, 2);
+	});
+
+	await t.test("turn phases are recorded once per turn and never exceed it", () => {
+		const phases = metricByName(batch, METRIC_TURN_PHASE_DURATION);
+		let phaseTotal = 0;
+		for (const phase of ["ttft", "streaming", "tool", "wait"]) {
+			const point = phases.dataPoints.find((p) => p.attributes[ATTR_TURN_PHASE] === phase);
+			assert.ok(point !== undefined, `phase not recorded: ${phase}`);
+			assert.ok(typeof point.value === "object");
+			assert.equal(point.value.count, 2, `${phase} recorded once per turn`);
+			phaseTotal += point.value.sum ?? 0;
+		}
+		const turnDurations = metricByName(batch, METRIC_TURN_DURATION);
+		let turnTotal = 0;
+		for (const point of turnDurations.dataPoints) {
+			if (typeof point.value === "object") turnTotal += point.value.sum ?? 0;
+		}
+		assert.ok(
+			phaseTotal <= turnTotal,
+			`phases (${phaseTotal}ms) must decompose the turns (${turnTotal}ms)`,
+		);
+	});
+
+	await t.test("metrics drop per-session resource attributes, traces keep them", () => {
+		assert.equal(batch.resource.attributes[ATTR_SESSION_ID], undefined);
+		assert.equal(batch.resource.attributes[ATTR_PROJECT_PATH], undefined);
+		for (const span of spans) {
+			assert.equal(span.resource.attributes[ATTR_SESSION_ID], "sess-e2e");
+			assert.equal(span.resource.attributes[ATTR_PROJECT_PATH], cwd);
+		}
+	});
+
+	await t.test("session summary record carries the session totals", () => {
+		const record = logRecords.find(
+			(r) => r.attributes["pi.event.name"] === "pi.session.summary",
+		);
+		assert.ok(record !== undefined, "pi.session.summary not emitted");
+		const attrs = record.attributes;
+		assert.equal(attrs[ATTR_SESSION_ID], "sess-e2e");
+		assert.equal(attrs["pi.summary.turns"], 2);
+		assert.equal(
+			attrs["pi.summary.tokens.input"],
+			usage1.input + usage2.input + compactionUsage.input,
+		);
+		assert.equal(attrs["pi.summary.interventions.total"], 3);
+		assert.equal(attrs["pi.summary.interventions.steer"], 1);
+		assert.equal(attrs["pi.summary.models"], "claude-test");
+		const expectedCost =
+			usage1.cost.total + usage2.cost.total + compactionUsage.cost.total;
+		assert.ok(Math.abs(Number(attrs["pi.summary.cost.total_usd"]) - expectedCost) < 1e-6);
+		assert.equal(typeof attrs["pi.summary.duration_ms"], "number");
+		assert.equal(typeof attrs["pi.summary.agent_busy_ms"], "number");
 	});
 
 	await t.test("event log stream survives the shutdown flush", () => {

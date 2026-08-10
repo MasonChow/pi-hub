@@ -46,6 +46,7 @@ import {
 } from "./interventions.ts";
 import { createEventLogger, type EventLogger } from "./logs.ts";
 import { createMetrics, mergeAttrs, type PiMetrics } from "./metrics.ts";
+import { createSessionSummary, type SessionSummary } from "./summary.ts";
 import {
 	buildResource,
 	guard,
@@ -112,14 +113,30 @@ export function createPiOtel(
 		let traces: TraceManager | undefined;
 		let logs: EventLogger | undefined;
 		let sessionState: SessionState | undefined;
+		let summary: SessionSummary | undefined;
 		/** Mutable metric dimensions (model / provider / thinking level). */
 		let dims: Record<string, string> = {};
+		/**
+		 * `dims` snapshotted when the request payload was handed to the
+		 * provider, so a mid-flight model / thinking-level switch cannot
+		 * re-attribute the response that was already in the air.
+		 */
+		let requestDims: Record<string, string> | undefined;
 		let inputCount = 0;
 		let busyStartedAt: number | undefined;
 		let busyAccumMs = 0;
 		let turnStartedAt: number | undefined;
 		let llmT0: number | undefined;
 		let llmFirstChunkAt: number | undefined;
+		/** Per-turn phase accumulators, reset at every `turn_start`. */
+		let phaseMs = { ttft: 0, streaming: 0, tool: 0 };
+		/**
+		 * Open tool executions in the current turn. Tools run in parallel, so
+		 * busy time is measured over the 0 → 1 → 0 transitions rather than
+		 * summed per tool (which would double-count the overlap).
+		 */
+		let toolsInFlight = 0;
+		let toolBusyStartedAt: number | undefined;
 		const toolStarts = new Map<string, { toolName: string; startedAt: number }>();
 
 		function resetSession(): void {
@@ -128,14 +145,39 @@ export function createPiOtel(
 			traces = undefined;
 			logs = undefined;
 			sessionState = undefined;
+			summary = undefined;
 			dims = {};
+			requestDims = undefined;
 			inputCount = 0;
 			busyStartedAt = undefined;
 			busyAccumMs = 0;
 			turnStartedAt = undefined;
 			llmT0 = undefined;
 			llmFirstChunkAt = undefined;
+			resetTurnPhases();
 			toolStarts.clear();
+		}
+
+		function resetTurnPhases(): void {
+			phaseMs = { ttft: 0, streaming: 0, tool: 0 };
+			toolsInFlight = 0;
+			toolBusyStartedAt = undefined;
+		}
+
+		/**
+		 * Emit the additive turn breakdown. `wait` is the remainder — hooks,
+		 * harness work, and time the turn sat waiting — and is clamped at
+		 * zero so the phases never over-report the turn they belong to.
+		 */
+		function recordTurnPhases(turnMs: number): void {
+			if (toolsInFlight > 0 && toolBusyStartedAt !== undefined) {
+				phaseMs.tool += Date.now() - toolBusyStartedAt;
+			}
+			const accounted = phaseMs.ttft + phaseMs.streaming + phaseMs.tool;
+			metrics?.recordTurnPhase("ttft", phaseMs.ttft, dims);
+			metrics?.recordTurnPhase("streaming", phaseMs.streaming, dims);
+			metrics?.recordTurnPhase("tool", phaseMs.tool, dims);
+			metrics?.recordTurnPhase("wait", Math.max(0, turnMs - accounted), dims);
 		}
 
 		function costOverrideFor(modelId: string): ModelCostOverride | undefined {
@@ -170,6 +212,7 @@ export function createPiOtel(
 			const kind = classify(signal);
 			if (kind === null) return;
 			metrics?.recordIntervention(kind, dims);
+			summary?.addIntervention(kind);
 			logs?.intervention({ kind, source: signal.source });
 		}
 
@@ -289,6 +332,7 @@ export function createPiOtel(
 				});
 				handles = initOtel(await buildResource(attrs), options);
 				metrics = createMetrics(handles.meter);
+				summary = createSessionSummary(Date.now());
 				const currentMetrics = metrics;
 				traces = createTraceManager(handles.tracer, sessionState, {
 					stateFilePath,
@@ -330,6 +374,22 @@ export function createPiOtel(
 			"session_shutdown",
 			guard(async (_event: SessionShutdownEvent) => {
 				traces?.endSession();
+				// Quitting mid-run: the agent never settled, so fold the
+				// unsettled busy stretch in before totalling.
+				if (busyStartedAt !== undefined) {
+					busyAccumMs += Date.now() - busyStartedAt;
+					busyStartedAt = undefined;
+				}
+				if (busyAccumMs > 0) {
+					summary?.addBusyMs(busyAccumMs);
+					busyAccumMs = 0;
+				}
+				if (summary !== undefined) {
+					logs?.sessionSummary({
+						sessionId: sessionState?.sessionId,
+						totals: summary.attributes(Date.now()),
+					});
+				}
 				logs?.sessionShutdown({ sessionId: sessionState?.sessionId });
 				await handles?.forceFlushAll();
 			}),
@@ -345,6 +405,9 @@ export function createPiOtel(
 					{ tokensBefore: entry.tokensBefore, reason: event.reason, usage: entry.usage },
 					dims,
 				);
+				if (entry.usage !== undefined) {
+					summary?.addUsage(entry.usage, dims[ATTR_AI_MODEL]);
+				}
 				logs?.sessionCompact({
 					sessionId: sessionState?.sessionId,
 					reason: event.reason,
@@ -383,6 +446,7 @@ export function createPiOtel(
 				}
 				if (busyAccumMs > 0) {
 					metrics?.recordAgentDuration(busyAccumMs, dims);
+					summary?.addBusyMs(busyAccumMs);
 					busyAccumMs = 0;
 				}
 				const text = lastAssistantText(ctx);
@@ -396,6 +460,7 @@ export function createPiOtel(
 			"turn_start",
 			guard((event: TurnStartEvent) => {
 				turnStartedAt = event.timestamp;
+				resetTurnPhases();
 				traces?.startTurn(event.turnIndex, event.timestamp);
 			}),
 		);
@@ -404,10 +469,14 @@ export function createPiOtel(
 			"turn_end",
 			guard((_event: TurnEndEvent, ctx: ExtensionContext) => {
 				metrics?.recordTurn(dims);
+				summary?.addTurn();
 				if (turnStartedAt !== undefined) {
-					metrics?.recordTurnDuration(Date.now() - turnStartedAt, dims);
+					const turnMs = Date.now() - turnStartedAt;
+					metrics?.recordTurnDuration(turnMs, dims);
+					recordTurnPhases(turnMs);
 					turnStartedAt = undefined;
 				}
+				resetTurnPhases();
 				traces?.endTurn();
 				sampleContext(ctx);
 			}),
@@ -419,6 +488,7 @@ export function createPiOtel(
 			guard((_event: BeforeProviderRequestEvent) => {
 				llmT0 = Date.now();
 				llmFirstChunkAt = undefined;
+				requestDims = { ...dims };
 				traces?.startLlmRequest();
 			}),
 		);
@@ -439,7 +509,9 @@ export function createPiOtel(
 				if (llmFirstChunkAt === undefined) {
 					llmFirstChunkAt = Date.now();
 					if (llmT0 !== undefined) {
-						metrics?.recordTtft(llmFirstChunkAt - llmT0, dims);
+						const ttft = llmFirstChunkAt - llmT0;
+						metrics?.recordTtft(ttft, requestDims ?? dims);
+						phaseMs.ttft += Math.max(0, ttft);
 					}
 				}
 			}),
@@ -452,19 +524,24 @@ export function createPiOtel(
 				const message = event.message;
 				if (message.role !== "assistant") return;
 				const now = Date.now();
-				const attrs = mergeAttrs(dims, {
+				const attrs = mergeAttrs(requestDims ?? dims, {
 					[ATTR_AI_MODEL]: message.model,
 					[ATTR_AI_PROVIDER]: message.provider,
 				});
-				metrics?.recordUsage(withCostOverride(message.usage, message.model), attrs);
+				const usage = withCostOverride(message.usage, message.model);
+				metrics?.recordUsage(usage, attrs);
+				summary?.addUsage(usage, message.model);
 				if (llmT0 !== undefined) {
 					metrics?.recordLlmDuration(now - llmT0, attrs);
 				}
 				if (llmFirstChunkAt !== undefined) {
-					metrics?.recordStreamingDuration(now - llmFirstChunkAt, attrs);
+					const streamingMs = now - llmFirstChunkAt;
+					metrics?.recordStreamingDuration(streamingMs, attrs);
+					phaseMs.streaming += Math.max(0, streamingMs);
 				}
 				llmT0 = undefined;
 				llmFirstChunkAt = undefined;
+				requestDims = undefined;
 				traces?.endLlmRequest(message);
 				if (message.stopReason === "aborted") {
 					handleSignal({ source: "abort", message });
@@ -479,10 +556,13 @@ export function createPiOtel(
 		pi.on(
 			"tool_execution_start",
 			guard((event: ToolExecutionStartEvent) => {
+				const startedAt = Date.now();
 				toolStarts.set(event.toolCallId, {
 					toolName: event.toolName,
-					startedAt: Date.now(),
+					startedAt,
 				});
+				if (toolsInFlight === 0) toolBusyStartedAt = startedAt;
+				toolsInFlight += 1;
 				traces?.startTool(event.toolCallId, event.toolName);
 			}),
 		);
@@ -492,12 +572,20 @@ export function createPiOtel(
 			guard((event: ToolExecutionEndEvent) => {
 				const started = toolStarts.get(event.toolCallId);
 				toolStarts.delete(event.toolCallId);
+				const endedAt = Date.now();
 				if (started !== undefined) {
 					metrics?.recordToolDuration(
-						Date.now() - started.startedAt,
+						endedAt - started.startedAt,
 						{ toolName: event.toolName, isError: event.isError },
 						dims,
 					);
+				}
+				if (toolsInFlight > 0) {
+					toolsInFlight -= 1;
+					if (toolsInFlight === 0 && toolBusyStartedAt !== undefined) {
+						phaseMs.tool += endedAt - toolBusyStartedAt;
+						toolBusyStartedAt = undefined;
+					}
 				}
 				traces?.endTool(event.toolCallId, event.isError);
 				if (event.isError) {

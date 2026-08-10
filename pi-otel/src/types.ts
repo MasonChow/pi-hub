@@ -113,8 +113,14 @@ export interface PiOtelPlugin {
 }
 
 /**
- * Exporter injection seam, used by tests (in-memory exporters). Production
- * always uses the OTLP/HTTP exporters configured through `OTEL_*` env vars.
+ * Exporter injection seam. Defaults to OTLP/HTTP with JSON encoding,
+ * configured through the standard `OTEL_*` env vars.
+ *
+ * Two reasons to override: tests (in-memory exporters), and gateways that
+ * only accept `http/protobuf` — install
+ * `@opentelemetry/exporter-{trace,metrics,logs}-otlp-proto` in your
+ * enterprise package and pass those exporters here. They read the same
+ * `OTEL_*` env vars, so nothing else changes.
  */
 export interface PiOtelExporterOverrides {
 	metrics?: PushMetricExporter;

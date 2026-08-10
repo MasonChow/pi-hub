@@ -26,13 +26,18 @@ import {
 	METRIC_TOOL_DURATION,
 	type PiMetrics,
 } from "../src/metrics.ts";
+import { resourceFromAttributes } from "@opentelemetry/resources";
 import {
 	ATTR_COMPACTION_REASON,
 	ATTR_ERROR_TYPE,
+	ATTR_PROJECT_PATH,
+	ATTR_REQUIREMENT_ID,
+	ATTR_SESSION_ID,
 	ATTR_TOKEN_TYPE,
 	ATTR_TOOL_IS_ERROR,
 	ATTR_TOOL_NAME,
 } from "../src/attrs.ts";
+import { metricsResource } from "../src/otel.ts";
 
 interface Harness {
 	metrics: PiMetrics;
@@ -300,4 +305,35 @@ test("tool duration and errors carry their dimensions; invalid durations are ski
 		1,
 	);
 	await shutdown();
+});
+
+test("metricsResource drops the configured attributes only", () => {
+	const full = resourceFromAttributes({
+		[ATTR_SESSION_ID]: "s1",
+		[ATTR_PROJECT_PATH]: "/tmp/project",
+		[ATTR_REQUIREMENT_ID]: "REQ-1",
+		"service.name": "pi",
+	});
+	const previous = process.env["PI_OTEL_METRICS_EXCLUDE_ATTRS"];
+	try {
+		delete process.env["PI_OTEL_METRICS_EXCLUDE_ATTRS"];
+		assert.deepEqual(metricsResource(full).attributes, {
+			[ATTR_REQUIREMENT_ID]: "REQ-1",
+			"service.name": "pi",
+		});
+
+		process.env["PI_OTEL_METRICS_EXCLUDE_ATTRS"] = ` ${ATTR_REQUIREMENT_ID} , `;
+		assert.deepEqual(metricsResource(full).attributes, {
+			[ATTR_SESSION_ID]: "s1",
+			[ATTR_PROJECT_PATH]: "/tmp/project",
+			"service.name": "pi",
+		});
+
+		// Explicit empty value opts back into the full attribute set.
+		process.env["PI_OTEL_METRICS_EXCLUDE_ATTRS"] = "";
+		assert.deepEqual(metricsResource(full).attributes, full.attributes);
+	} finally {
+		if (previous === undefined) delete process.env["PI_OTEL_METRICS_EXCLUDE_ATTRS"];
+		else process.env["PI_OTEL_METRICS_EXCLUDE_ATTRS"] = previous;
+	}
 });

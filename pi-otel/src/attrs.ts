@@ -105,6 +105,11 @@ export const ATTR_THINKING_LEVEL = "pi.thinking_level";
 export const ATTR_TOKEN_TYPE = "pi.token.type";
 /** Intervention counter dimension (see InterventionKind). */
 export const ATTR_INTERVENTION_KIND = "pi.intervention.kind";
+/**
+ * `pi.turn.phase.duration` dimension: ttft | streaming | tool | wait. The
+ * four phases of one turn sum to that turn's `pi.turn.duration`.
+ */
+export const ATTR_TURN_PHASE = "pi.turn.phase";
 
 // --- genai-semconv (compatibility subset on LLM spans) ---
 

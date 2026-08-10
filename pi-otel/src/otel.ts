@@ -12,6 +12,7 @@
 import {
 	createNoopMeter,
 	ProxyTracerProvider,
+	type Attributes,
 	type Counter,
 	type Meter,
 	type Tracer,
@@ -28,7 +29,7 @@ import { BatchLogRecordProcessor, LoggerProvider } from "@opentelemetry/sdk-logs
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
-import { ATTR_PI_VERSION } from "./attrs.ts";
+import { ATTR_PI_VERSION, ATTR_PROJECT_PATH, ATTR_SESSION_ID } from "./attrs.ts";
 import type { PiOtelOptions } from "./types.ts";
 
 const SCOPE_NAME = "pi-otel";
@@ -81,6 +82,39 @@ export async function buildResource(
 	return defaultResource().merge(resourceFromAttributes(merged));
 }
 
+/**
+ * Resource attributes dropped from metrics by default. Backends that
+ * promote resource attributes to metric labels explode on per-session ids;
+ * the project path follows because it is per-checkout identity, not a
+ * fleet-level dimension. Traces and logs always keep the full set — that is
+ * where per-session drill-down belongs.
+ */
+const DEFAULT_METRICS_EXCLUDE_ATTRS = [ATTR_SESSION_ID, ATTR_PROJECT_PATH];
+
+/**
+ * `PI_OTEL_METRICS_EXCLUDE_ATTRS`, comma-separated. Unset falls back to the
+ * default list; set to an empty string to keep every attribute on metrics.
+ */
+function metricsExcludedAttrs(): Set<string> {
+	const raw = process.env["PI_OTEL_METRICS_EXCLUDE_ATTRS"];
+	const keys =
+		raw === undefined
+			? DEFAULT_METRICS_EXCLUDE_ATTRS
+			: raw.split(",").map((key) => key.trim());
+	return new Set(keys.filter((key) => key !== ""));
+}
+
+/** The metrics-side view of the session resource (see above). */
+export function metricsResource(resource: Resource): Resource {
+	const excluded = metricsExcludedAttrs();
+	if (excluded.size === 0) return resource;
+	const kept: Attributes = {};
+	for (const [key, value] of Object.entries(resource.attributes)) {
+		if (!excluded.has(key)) kept[key] = value;
+	}
+	return resourceFromAttributes(kept);
+}
+
 function noopHandles(): OtelHandles {
 	return {
 		meter: createNoopMeter(),
@@ -105,7 +139,7 @@ export function initOtel(
 	try {
 		const exporters = options?.exporters;
 		const meterProvider = new MeterProvider({
-			resource,
+			resource: metricsResource(resource),
 			readers: [
 				new PeriodicExportingMetricReader({
 					exporter: exporters?.metrics ?? new OTLPMetricExporter(),
