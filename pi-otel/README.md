@@ -96,7 +96,13 @@ sum by (pi_requirement_id) (increase(pi_cost_usd_total[30d]))
 
 All metrics carry the session's resource attributes (`pi.requirement.id` plus anything your plugins add) — see [metric cardinality](#metric-cardinality) for the two attributes held back by default.
 
-Every metric below additionally carries the **common dimensions** `pi.ai.model`, `pi.ai.provider`, and `pi.thinking_level`, so cost, latency and intervention rate all break down by model and by thinking level. On LLM metrics the model and provider come from the response itself, and the thinking level is the one snapshotted when the request was sent.
+Every metric below additionally carries the **common dimensions** `pi.ai.model`, `pi.ai.provider`, and `pi.thinking_level`, so cost, latency and intervention rate all break down by model and by thinking level.
+
+Which model a metric is labelled with follows what produced it, so the series of one turn can be joined:
+
+- **Request-scoped** (`pi.tokens`, `pi.cost.usd`, `pi.llm.*`): the response's own model and provider, with the thinking level snapshotted when the request was sent.
+- **Turn-scoped** (`pi.turns`, `pi.turn.duration`, `pi.turn.phase.duration`): the model of the turn's last request — the one that did the turn's work — so switching model mid-turn cannot label a turn with a model that produced none of it.
+- **Everything else** (`pi.agent.duration`, interventions, context, compaction, errors): the session's current selection, since they are not tied to one request.
 
 | Metric | Type | Extra dimensions | Meaning |
 | --- | --- | --- | --- |
@@ -106,18 +112,24 @@ Every metric below additionally carries the **common dimensions** `pi.ai.model`,
 | `pi.human.interventions` | Counter | `pi.intervention.kind` = `steer` \| `follow_up` \| `interrupt` \| `approval` \| `question` | Times a human had to come back to the session |
 | `pi.agent.duration` | Histogram | — | `agent_start → agent_settled`, real agent busy time |
 | `pi.turn.duration` | Histogram | — | Single turn duration |
-| `pi.turn.phase.duration` | Histogram | `pi.turn.phase` = `ttft` \| `streaming` \| `tool` \| `wait` | The same turn, split into four phases that sum back to `pi.turn.duration` — stack them for "where did the time go" |
+| `pi.turn.phase.duration` | Histogram | `pi.turn.phase` = `ttft` \| `streaming` \| `tool` \| `wait` | The same turn, split into four phases that sum to exactly `pi.turn.duration` — stack them for "where did the time go" |
 | `pi.llm.duration` | Histogram | — | Single LLM request duration |
 | `pi.llm.ttft` | Histogram | — | Time to first streamed chunk |
 | `pi.llm.streaming.duration` | Histogram | — | First chunk → last token |
 | `pi.tool.duration` | Histogram | `pi.tool.name`, `pi.tool.is_error` | Single tool execution; the `is_error` split gives per-tool failure rate |
 | `pi.context.tokens` / `pi.context.usage_ratio` | Gauge | — | Context window usage, sampled per turn |
-| `pi.compaction` | Counter | `pi.compaction.reason`, `pi.compaction.tokens_before` | Context compactions (the compaction's own LLM usage is folded into `pi.tokens` / `pi.cost.usd`) |
+| `pi.compaction` | Counter | `pi.compaction.reason`, `pi.compaction.tokens_before` | Context compactions. The compaction's own LLM usage is folded into `pi.tokens` / `pi.cost.usd` (with `costTable` applied) and attributed to the session's current model — pi does not report which model compacted, so it is left out of `pi.summary.models` |
 | `pi.errors` | Counter | `pi.error.scope` = `llm` \| `tool` \| `agent` \| `provider` | Runtime errors |
 | `pi.telemetry.errors` | Counter | — | Errors swallowed by pi-otel's own fail-open guard |
 | `pi.telemetry.dropped` | Counter | — | Signals pi-otel discarded itself (out-of-order span bookkeeping, …) |
 
 Useful derived views: *autonomy rate* = `1 − interventions / turns`; per-requirement busy time = `sum by (pi_requirement_id) (pi_agent_duration_sum)`.
+
+**Turn phases** are a strict decomposition, which costs a little precision at the edges:
+
+- A tool still running when a turn ends keeps counting into the next turn, so its time stays `tool` instead of reappearing as `wait`.
+- A response that never streams (deferred, non-streamed) counts as `ttft` — it was all time waiting on the model — but produces no `pi.llm.ttft` sample, since there was no first chunk to time.
+- When work that began in an earlier turn hands a turn more measured time than the turn lasted, the measured phases are scaled to fit rather than overflowing. The four phases therefore always sum to the turn; individual phases of such a turn read low.
 
 **Token accounting:** `reasoning` tokens are a **subset of `output`**, and `cache_write_1h` a subset of `cache_write` — sum `input + output + cache_read + cache_write` for totals and treat the subsets as drill-downs, or you will double-count. `pi.cost.usd` is pi's own cost computation; override pricing via a plugin `costTable` only if your proxy bills differently.
 
@@ -190,7 +202,7 @@ The core knows nothing about Jira, org charts, or approval systems. Ship a thin 
 | --- | --- | --- |
 | `resolveAttributes(ctx)` | Once per session, at `session_start`; result is frozen and applied as resource attributes to every signal | Org dimensions (`team`, `user`), ticket metadata. Must be stable within a session — no timestamps, no random values |
 | `classifyIntervention(signal)` | For every candidate signal (user input, abort, settled question, bus message); plugins run in order — returning a kind adopts it, returning `null` vetoes the signal (built-in rules are skipped), no opinion passes to the next plugin, and the built-in classifier runs last | Your own definition of "a human had to step in" |
-| `costTable` | On cost computation, keyed by model id | Internal proxy pricing that differs from pi's public price table (USD per 1M tokens) |
+| `costTable` | On cost computation for every LLM call, including compaction, keyed by model id | Internal proxy pricing that differs from pi's public price table (USD per 1M tokens) |
 | `redact(attrs)` | With the session's resource attributes at `session_start`, before they are frozen | Dropping or masking attributes (e.g. `pi.project.path`) per privacy policy |
 
 A copy-paste skeleton with all four hooks lives in [`examples/enterprise-plugin.example.ts`](./examples/enterprise-plugin.example.ts).

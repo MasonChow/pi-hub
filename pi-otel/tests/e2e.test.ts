@@ -39,6 +39,7 @@ import {
 	SPAN_HARNESS_TURN,
 } from "../src/attrs.ts";
 import {
+	METRIC_AGENT_DURATION,
 	METRIC_COST_USD,
 	METRIC_HUMAN_INTERVENTIONS,
 	METRIC_LLM_TTFT,
@@ -593,9 +594,277 @@ test("overlapping tools collapse into one busy window; a mid-flight model switch
 		}
 	});
 
-	await t.test("the switch still applies to what comes after the request", () => {
-		const turns = metricByName(batch, METRIC_TURNS);
-		const models = turns.dataPoints.map((p) => p.attributes[ATTR_AI_MODEL]);
+	await t.test("turn-scoped metrics follow the model that did the turn's work", () => {
+		// Same label as the turn's tokens above, so the two join per turn.
+		for (const name of [METRIC_TURNS, METRIC_TURN_DURATION, METRIC_TURN_PHASE_DURATION]) {
+			const models = metricByName(batch, name).dataPoints.map(
+				(p) => p.attributes[ATTR_AI_MODEL],
+			);
+			assert.deepEqual(
+				[...new Set(models)],
+				["claude-test"],
+				`${name} should carry the model that ran the request`,
+			);
+		}
+	});
+
+	await t.test("the switch applies to metrics that are not request-scoped", () => {
+		const agent = metricByName(batch, METRIC_AGENT_DURATION);
+		const models = agent.dataPoints.map((p) => p.attributes[ATTR_AI_MODEL]);
 		assert.deepEqual(models, ["claude-next"]);
+	});
+});
+
+function phaseSum(batch: ResourceMetrics, phase: string): number {
+	let sum = 0;
+	for (const point of metricByName(batch, METRIC_TURN_PHASE_DURATION).dataPoints) {
+		if (point.attributes[ATTR_TURN_PHASE] === phase && typeof point.value === "object") {
+			sum += point.value.sum ?? 0;
+		}
+	}
+	return sum;
+}
+
+function histogramSum(batch: ResourceMetrics, name: string): number {
+	let sum = 0;
+	for (const point of metricByName(batch, name).dataPoints) {
+		if (typeof point.value === "object") sum += point.value.sum ?? 0;
+	}
+	return sum;
+}
+
+/**
+ * Event flows that cross a turn boundary or skip streaming entirely. Both
+ * used to leak time into `wait`, and the straddling request used to push
+ * the phases past the turn they were recorded against.
+ */
+test("work that crosses a turn boundary stays in its phase and never exceeds the turn", async (t) => {
+	delete process.env["PI_REQUIREMENT_ID"];
+	delete process.env["OTEL_SDK_DISABLED"];
+	delete process.env["PI_OTEL_DISABLED"];
+
+	const dir = mkdtempSync(join(tmpdir(), "pi-otel-straddle-"));
+	const stateFile = join(dir, "state.json");
+	const cwd = join(dir, "project");
+
+	const metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+	const { host, handlers } = createHost();
+	createPiOtel({
+		stateFilePath: stateFile,
+		exporters: {
+			metrics: metricExporter,
+			traces: new InMemorySpanExporter(),
+			logs: new InMemoryLogRecordExporter(),
+		},
+	})(host);
+
+	const ctx = createCtx(cwd);
+	const fire = async (event: string, payload: Record<string, unknown>): Promise<void> => {
+		for (const handler of handlers.get(event) ?? []) {
+			await handler(payload, ctx);
+		}
+	};
+
+	await fire("session_start", { type: "session_start", reason: "startup" });
+	await fire("agent_start", { type: "agent_start" });
+
+	// Turn 0: a tool starts here and a response starts streaming here, but
+	// both finish after the turn has already ended.
+	await fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	await fire("before_provider_request", { type: "before_provider_request", payload: {} });
+	const assistant = assistantMessage("toolUse", usage1);
+	await fire("message_start", { type: "message_start", message: assistant });
+	await fire("message_update", {
+		type: "message_update",
+		message: assistant,
+		assistantMessageEvent: { type: "text_delta" },
+	});
+	await fire("tool_execution_start", {
+		type: "tool_execution_start",
+		toolCallId: "call-straddle",
+		toolName: "bash",
+		args: {},
+	});
+	await sleep(30);
+	await fire("turn_end", { type: "turn_end", turnIndex: 0, message: assistant, toolResults: [] });
+
+	// Turn 1 inherits the still-open tool, which runs on well past the
+	// boundary before ending here.
+	await fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() });
+	await fire("message_end", { type: "message_end", message: assistant });
+	await sleep(60);
+	await fire("tool_execution_end", {
+		type: "tool_execution_end",
+		toolCallId: "call-straddle",
+		toolName: "bash",
+		result: {},
+		isError: false,
+	});
+	await sleep(30);
+	await fire("turn_end", { type: "turn_end", turnIndex: 1, message: assistant, toolResults: [] });
+
+	await fire("agent_end", { type: "agent_end", messages: [] });
+	await fire("agent_settled", { type: "agent_settled" });
+	await fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+
+	const batches = metricExporter.getMetrics();
+	const batch = batches[batches.length - 1];
+
+	await t.test("phases sum to exactly the turn time they decompose", () => {
+		const phaseTotal =
+			phaseSum(batch, "ttft") +
+			phaseSum(batch, "streaming") +
+			phaseSum(batch, "tool") +
+			phaseSum(batch, "wait");
+		const turnTotal = histogramSum(batch, METRIC_TURN_DURATION);
+		assert.ok(
+			Math.abs(phaseTotal - turnTotal) <= 2,
+			`phases ${phaseTotal}ms vs turns ${turnTotal}ms`,
+		);
+	});
+
+	await t.test("the tool's time after the boundary stays tool time", () => {
+		const toolPhase = phaseSum(batch, "tool");
+		const toolDuration = histogramSum(batch, METRIC_TOOL_DURATION);
+		// The tool ran ~90ms, only ~30ms of it inside the turn it started in.
+		// Without the carry-over the other ~60ms is dropped from the phase
+		// and silently reappears as `wait`.
+		assert.ok(toolDuration >= 80, `tool did not run long enough: ${toolDuration}ms`);
+		assert.ok(
+			toolPhase >= toolDuration - 15,
+			`tool phase lost its tail: ${toolPhase}ms of ${toolDuration}ms`,
+		);
+	});
+});
+
+/**
+ * A request whose streaming began in the previous turn hands the closing
+ * turn more measured time than the turn lasted. The phases are scaled to
+ * fit instead of overflowing into a negative (clamped-to-zero) `wait`.
+ */
+test("measured phases never overflow the turn they are recorded against", async () => {
+	delete process.env["PI_REQUIREMENT_ID"];
+	delete process.env["OTEL_SDK_DISABLED"];
+	delete process.env["PI_OTEL_DISABLED"];
+
+	const dir = mkdtempSync(join(tmpdir(), "pi-otel-overflow-"));
+	const metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+	const { host, handlers } = createHost();
+	createPiOtel({
+		stateFilePath: join(dir, "state.json"),
+		exporters: {
+			metrics: metricExporter,
+			traces: new InMemorySpanExporter(),
+			logs: new InMemoryLogRecordExporter(),
+		},
+	})(host);
+
+	const ctx = createCtx(join(dir, "project"));
+	const fire = async (event: string, payload: Record<string, unknown>): Promise<void> => {
+		for (const handler of handlers.get(event) ?? []) {
+			await handler(payload, ctx);
+		}
+	};
+
+	const assistant = assistantMessage("stop", usage2);
+	await fire("session_start", { type: "session_start", reason: "startup" });
+	await fire("agent_start", { type: "agent_start" });
+
+	// First chunk arrives in turn 0; the turn then ends while the response
+	// is still streaming.
+	await fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	await fire("before_provider_request", { type: "before_provider_request", payload: {} });
+	await fire("message_start", { type: "message_start", message: assistant });
+	await fire("message_update", {
+		type: "message_update",
+		message: assistant,
+		assistantMessageEvent: { type: "text_delta" },
+	});
+	await sleep(50);
+	await fire("turn_end", { type: "turn_end", turnIndex: 0, message: assistant, toolResults: [] });
+
+	// Turn 1 is over almost immediately, but collects all ~50ms of streaming.
+	await fire("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() });
+	await fire("message_end", { type: "message_end", message: assistant });
+	await fire("turn_end", { type: "turn_end", turnIndex: 1, message: assistant, toolResults: [] });
+
+	await fire("agent_end", { type: "agent_end", messages: [] });
+	await fire("agent_settled", { type: "agent_settled" });
+	await fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+
+	const batch = metricExporter.getMetrics().at(-1);
+	assert.ok(batch !== undefined);
+	const phaseTotal =
+		phaseSum(batch, "ttft") +
+		phaseSum(batch, "streaming") +
+		phaseSum(batch, "tool") +
+		phaseSum(batch, "wait");
+	const turnTotal = histogramSum(batch, METRIC_TURN_DURATION);
+	assert.ok(
+		Math.abs(phaseTotal - turnTotal) <= 2,
+		`phases ${phaseTotal}ms must decompose turns ${turnTotal}ms`,
+	);
+});
+
+test("a response that never streams counts as model time, not idle wait", async (t) => {
+	delete process.env["PI_REQUIREMENT_ID"];
+	delete process.env["OTEL_SDK_DISABLED"];
+	delete process.env["PI_OTEL_DISABLED"];
+
+	const dir = mkdtempSync(join(tmpdir(), "pi-otel-deferred-"));
+	const stateFile = join(dir, "state.json");
+	const cwd = join(dir, "project");
+
+	const metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+	const { host, handlers } = createHost();
+	createPiOtel({
+		stateFilePath: stateFile,
+		exporters: {
+			metrics: metricExporter,
+			traces: new InMemorySpanExporter(),
+			logs: new InMemoryLogRecordExporter(),
+		},
+	})(host);
+
+	const ctx = createCtx(cwd);
+	const fire = async (event: string, payload: Record<string, unknown>): Promise<void> => {
+		for (const handler of handlers.get(event) ?? []) {
+			await handler(payload, ctx);
+		}
+	};
+
+	await fire("session_start", { type: "session_start", reason: "startup" });
+	await fire("agent_start", { type: "agent_start" });
+	await fire("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() });
+	await fire("before_provider_request", { type: "before_provider_request", payload: {} });
+	const assistant = assistantMessage("stop", usage2);
+	await fire("message_start", { type: "message_start", message: assistant });
+	// No message_update at all — deferred / non-streamed response.
+	await sleep(40);
+	await fire("message_end", { type: "message_end", message: assistant });
+	await fire("turn_end", { type: "turn_end", turnIndex: 0, message: assistant, toolResults: [] });
+	await fire("agent_end", { type: "agent_end", messages: [] });
+	await fire("agent_settled", { type: "agent_settled" });
+	await fire("session_shutdown", { type: "session_shutdown", reason: "quit" });
+
+	const batch = metricExporter.getMetrics().at(-1);
+	assert.ok(batch !== undefined);
+
+	await t.test("the request time lands in ttft, not wait", () => {
+		assert.ok(phaseSum(batch, "ttft") >= 30, "model latency was not attributed");
+		assert.ok(phaseSum(batch, "wait") <= 15, "model latency leaked into wait");
+	});
+
+	await t.test("no pi.llm.ttft sample is invented for it", () => {
+		// There was no first chunk to time, so the histogram stays empty —
+		// and an instrument with no recordings is never exported at all.
+		for (const scope of batch.scopeMetrics) {
+			for (const metric of scope.metrics) {
+				if (metric.descriptor.name !== METRIC_LLM_TTFT) continue;
+				for (const point of metric.dataPoints) {
+					if (typeof point.value === "object") assert.equal(point.value.count, 0);
+				}
+			}
+		}
 	});
 });

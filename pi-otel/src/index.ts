@@ -122,6 +122,14 @@ export function createPiOtel(
 		 * re-attribute the response that was already in the air.
 		 */
 		let requestDims: Record<string, string> | undefined;
+		/**
+		 * `requestDims` of the turn's most recent request, kept until the
+		 * turn ends. Turn-scoped metrics use it so a mid-turn model switch
+		 * cannot label a turn with a model that did none of its work — the
+		 * turn's phases and its tokens then carry the same model, which is
+		 * what makes the two joinable per turn.
+		 */
+		let turnRequestDims: Record<string, string> | undefined;
 		let inputCount = 0;
 		let busyStartedAt: number | undefined;
 		let busyAccumMs = 0;
@@ -131,11 +139,14 @@ export function createPiOtel(
 		/** Per-turn phase accumulators, reset at every `turn_start`. */
 		let phaseMs = { ttft: 0, streaming: 0, tool: 0 };
 		/**
-		 * Open tool executions in the current turn. Tools run in parallel, so
-		 * busy time is measured over the 0 → 1 → 0 transitions rather than
-		 * summed per tool (which would double-count the overlap).
+		 * Start of the currently open tool-busy window, or undefined when no
+		 * tool is running. Tools run in parallel, so busy time is measured
+		 * over this single window — opened when `toolStarts` goes from empty
+		 * to non-empty and closed when it drains — rather than summed per
+		 * tool, which would double-count the overlap. `toolStarts` is the
+		 * only in-flight bookkeeping: a separate counter could drift away
+		 * from it on a stray or duplicate event.
 		 */
-		let toolsInFlight = 0;
 		let toolBusyStartedAt: number | undefined;
 		const toolStarts = new Map<string, { toolName: string; startedAt: number }>();
 
@@ -148,36 +159,46 @@ export function createPiOtel(
 			summary = undefined;
 			dims = {};
 			requestDims = undefined;
+			turnRequestDims = undefined;
 			inputCount = 0;
 			busyStartedAt = undefined;
 			busyAccumMs = 0;
 			turnStartedAt = undefined;
 			llmT0 = undefined;
 			llmFirstChunkAt = undefined;
-			resetTurnPhases();
-			toolStarts.clear();
+			phaseMs = { ttft: 0, streaming: 0, tool: 0 };
+			endToolBusyWindow();
 		}
 
-		function resetTurnPhases(): void {
-			phaseMs = { ttft: 0, streaming: 0, tool: 0 };
-			toolsInFlight = 0;
+		/** Forget any open tool window; the tools themselves are gone too. */
+		function endToolBusyWindow(): void {
+			toolStarts.clear();
 			toolBusyStartedAt = undefined;
 		}
 
 		/**
-		 * Emit the additive turn breakdown. `wait` is the remainder — hooks,
-		 * harness work, and time the turn sat waiting — and is clamped at
-		 * zero so the phases never over-report the turn they belong to.
+		 * Emit the additive turn breakdown: the four phases always sum to
+		 * exactly `turnMs`, so stacking them is a true decomposition.
+		 *
+		 * `wait` is the remainder — hooks, harness work, and time the turn
+		 * sat idle. A tool still running at the boundary contributes its
+		 * elapsed part here and keeps counting into the next turn; a request
+		 * that started before this turn can still hand it more measured time
+		 * than the turn itself lasted, so the measured phases are scaled back
+		 * to fit rather than allowed to overflow into a negative `wait`.
 		 */
-		function recordTurnPhases(turnMs: number): void {
-			if (toolsInFlight > 0 && toolBusyStartedAt !== undefined) {
-				phaseMs.tool += Date.now() - toolBusyStartedAt;
+		function recordTurnPhases(turnMs: number, attrs: Record<string, string>): void {
+			const now = Date.now();
+			if (toolStarts.size > 0 && toolBusyStartedAt !== undefined) {
+				phaseMs.tool += now - toolBusyStartedAt;
+				toolBusyStartedAt = now;
 			}
-			const accounted = phaseMs.ttft + phaseMs.streaming + phaseMs.tool;
-			metrics?.recordTurnPhase("ttft", phaseMs.ttft, dims);
-			metrics?.recordTurnPhase("streaming", phaseMs.streaming, dims);
-			metrics?.recordTurnPhase("tool", phaseMs.tool, dims);
-			metrics?.recordTurnPhase("wait", Math.max(0, turnMs - accounted), dims);
+			const measured = phaseMs.ttft + phaseMs.streaming + phaseMs.tool;
+			const scale = measured > turnMs && measured > 0 ? turnMs / measured : 1;
+			metrics?.recordTurnPhase("ttft", phaseMs.ttft * scale, attrs);
+			metrics?.recordTurnPhase("streaming", phaseMs.streaming * scale, attrs);
+			metrics?.recordTurnPhase("tool", phaseMs.tool * scale, attrs);
+			metrics?.recordTurnPhase("wait", Math.max(0, turnMs - measured * scale), attrs);
 		}
 
 		function costOverrideFor(modelId: string): ModelCostOverride | undefined {
@@ -419,7 +440,9 @@ export function createPiOtel(
 					{ tokensBefore: entry.tokensBefore, reason: event.reason, usage },
 					dims,
 				);
-				if (usage !== undefined) summary?.addUsage(usage, model);
+				// No model is passed on: `pi.summary.models` lists the models
+				// that answered, and pi does not say which one compacted.
+				if (usage !== undefined) summary?.addUsage(usage);
 				logs?.sessionCompact({
 					sessionId: sessionState?.sessionId,
 					reason: event.reason,
@@ -461,6 +484,10 @@ export function createPiOtel(
 					summary?.addBusyMs(busyAccumMs);
 					busyAccumMs = 0;
 				}
+				// The agent is idle, so nothing can still be executing: drop
+				// any start whose end never arrived instead of letting it hold
+				// the busy window open for the rest of the session.
+				endToolBusyWindow();
 				const text = lastAssistantText(ctx);
 				if (text !== undefined) {
 					handleSignal({ source: "question", lastAssistantText: text });
@@ -472,7 +499,10 @@ export function createPiOtel(
 			"turn_start",
 			guard((event: TurnStartEvent) => {
 				turnStartedAt = event.timestamp;
-				resetTurnPhases();
+				// Only the accumulators reset: a tool still running keeps its
+				// window open so its time lands in the turn it runs through.
+				phaseMs = { ttft: 0, streaming: 0, tool: 0 };
+				turnRequestDims = undefined;
 				traces?.startTurn(event.turnIndex, event.timestamp);
 			}),
 		);
@@ -480,15 +510,18 @@ export function createPiOtel(
 		pi.on(
 			"turn_end",
 			guard((_event: TurnEndEvent, ctx: ExtensionContext) => {
-				metrics?.recordTurn(dims);
+				// Turn-scoped metrics carry the model that did the turn's
+				// work, not whatever is selected once it is over.
+				const turnAttrs = turnRequestDims ?? dims;
+				metrics?.recordTurn(turnAttrs);
 				summary?.addTurn();
 				if (turnStartedAt !== undefined) {
 					const turnMs = Date.now() - turnStartedAt;
-					metrics?.recordTurnDuration(turnMs, dims);
-					recordTurnPhases(turnMs);
+					metrics?.recordTurnDuration(turnMs, turnAttrs);
+					recordTurnPhases(turnMs, turnAttrs);
 					turnStartedAt = undefined;
 				}
-				resetTurnPhases();
+				phaseMs = { ttft: 0, streaming: 0, tool: 0 };
 				traces?.endTurn();
 				sampleContext(ctx);
 			}),
@@ -501,6 +534,7 @@ export function createPiOtel(
 				llmT0 = Date.now();
 				llmFirstChunkAt = undefined;
 				requestDims = { ...dims };
+				turnRequestDims = requestDims;
 				traces?.startLlmRequest();
 			}),
 		);
@@ -550,6 +584,13 @@ export function createPiOtel(
 					const streamingMs = now - llmFirstChunkAt;
 					metrics?.recordStreamingDuration(streamingMs, attrs);
 					phaseMs.streaming += Math.max(0, streamingMs);
+				} else if (llmT0 !== undefined) {
+					// Deferred or non-streamed response: no chunk ever arrived,
+					// so the whole request was time waiting on the model. It
+					// counts as `ttft` for the phase split (otherwise model
+					// latency would masquerade as idle `wait`), but not as a
+					// `pi.llm.ttft` sample — there was no first chunk to time.
+					phaseMs.ttft += Math.max(0, now - llmT0);
 				}
 				llmT0 = undefined;
 				llmFirstChunkAt = undefined;
@@ -569,12 +610,11 @@ export function createPiOtel(
 			"tool_execution_start",
 			guard((event: ToolExecutionStartEvent) => {
 				const startedAt = Date.now();
+				if (toolStarts.size === 0) toolBusyStartedAt = startedAt;
 				toolStarts.set(event.toolCallId, {
 					toolName: event.toolName,
 					startedAt,
 				});
-				if (toolsInFlight === 0) toolBusyStartedAt = startedAt;
-				toolsInFlight += 1;
 				traces?.startTool(event.toolCallId, event.toolName);
 			}),
 		);
@@ -585,21 +625,18 @@ export function createPiOtel(
 				const started = toolStarts.get(event.toolCallId);
 				toolStarts.delete(event.toolCallId);
 				const endedAt = Date.now();
-				// Only an end that closes a tracked start may move the busy
-				// counter: a stray or replayed end would otherwise close the
-				// window early and drop the remaining tools' time.
+				// Only an end that closes a tracked start may close the busy
+				// window: a stray or replayed end would otherwise end it early
+				// and drop the remaining tools' time.
 				if (started !== undefined) {
 					metrics?.recordToolDuration(
 						endedAt - started.startedAt,
 						{ toolName: event.toolName, isError: event.isError },
 						dims,
 					);
-					if (toolsInFlight > 0) {
-						toolsInFlight -= 1;
-						if (toolsInFlight === 0 && toolBusyStartedAt !== undefined) {
-							phaseMs.tool += endedAt - toolBusyStartedAt;
-							toolBusyStartedAt = undefined;
-						}
+					if (toolStarts.size === 0 && toolBusyStartedAt !== undefined) {
+						phaseMs.tool += endedAt - toolBusyStartedAt;
+						toolBusyStartedAt = undefined;
 					}
 				}
 				traces?.endTool(event.toolCallId, event.isError);
