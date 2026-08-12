@@ -16,6 +16,12 @@ pi install npm:@masonchow/pi-hud
 ↳ scout claude-sonnet-5 ↑42.1k ↓3.8k $0.031 ×2
 ```
 
+API key 形态（opencode 网关）示例：
+
+```text
+λ opencode-go/deepseek-v4-flash │ 用量 滚动0% · 周7% · 月4% │ 本次 $0.004
+```
+
 第 3 行只在本会话跑过 subagent 时出现。
 
 ## 适用范围
@@ -27,6 +33,7 @@ pi install npm:@masonchow/pi-hud
 ✅ subagent 逐个列出模型 / tokens / 成本，按 runId 去重
 ✅ 订阅额度：`openai-codex`（含剩余百分比与重置倒计时）
 ✅ API key 余额：deepseek / kimi / stepfun（其余供应商无查询 API，只显示本次花费）
+✅ opencode 网关用量：`opencode-go`（滚动 / 周 / 月三窗口已用百分比，来自官方 `GET /v1/usage`）
 
 ❌ 自定义布局、字段开关、主题配置（只有 `/hud` 一个开关）
 ❌ 跨会话历史统计、成本报表导出

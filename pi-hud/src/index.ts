@@ -247,6 +247,51 @@ export function fmtWindowLabel(seconds: number | undefined): string {
 	return `${Math.round(seconds / 86400)}d`;
 }
 
+// --- opencode 网关用量（opencode-go） -----------------------------------------
+//
+// opencode.ai zen 网关（baseUrl https://opencode.ai/zen/go/v1）没有余额查询接口，
+// 但有官方用量接口（真实抓包验证）：
+//   GET {baseUrl}/usage
+//   Authorization: Bearer <api key>
+// 响应形如：
+//   { "usage": { "rolling": { "status": "ok", "percent": 0, "resetsAt": "..." },
+//                 "weekly":  { "status": "ok", "percent": 7, "resetsAt": "..." },
+//                 "monthly": { "status": "ok", "percent": 4, "resetsAt": "..." } } }
+// percent 是各窗口已用百分比；status 非 "ok"（如被限流）的窗口跳过。
+
+export interface OpencodeWindow {
+	label: string;
+	usedPercent: number;
+}
+
+export interface OpencodeUsage {
+	windows: OpencodeWindow[];
+}
+
+const OPENCODE_WINDOW_LABELS: Record<string, string> = {
+	rolling: "滚动",
+	weekly: "周",
+	monthly: "月",
+};
+
+/** 解析 GET .../usage 的响应体；一个窗口都解析不出时返回 null */
+export function parseOpencodeUsage(json: unknown): OpencodeUsage | null {
+	if (typeof json !== "object" || json === null) return null;
+	const usage = (json as Record<string, unknown>).usage;
+	if (typeof usage !== "object" || usage === null) return null;
+	const windows: OpencodeWindow[] = [];
+	for (const [key, label] of Object.entries(OPENCODE_WINDOW_LABELS)) {
+		const w = (usage as Record<string, unknown>)[key];
+		if (typeof w !== "object" || w === null) continue;
+		const rec = w as Record<string, unknown>;
+		if (rec.status !== "ok") continue;
+		const percent = Number(rec.percent);
+		if (!Number.isFinite(percent)) continue;
+		windows.push({ label, usedPercent: percent });
+	}
+	return windows.length > 0 ? { windows } : null;
+}
+
 // --- API key 余额 -----------------------------------------------------------
 
 export interface Balance {
@@ -398,6 +443,8 @@ export function summarizeSubagents(
 const WIDGET_ID = "hud";
 const BALANCE_TTL_MS = 5 * 60 * 1000;
 const CODEX_QUOTA_TTL_MS = 5 * 60 * 1000;
+const OPENCODE_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
+const OPENCODE_USAGE_TTL_MS = 5 * 60 * 1000;
 const STREAM_REFRESH_MS = 300;
 
 export default function hud(pi: ExtensionAPI) {
@@ -410,6 +457,9 @@ export default function hud(pi: ExtensionAPI) {
 	let codexQuota: CodexQuota | null = null;
 	let codexQuotaAt = 0;
 	let codexQuotaFailed = false; // 上一次查询失败（渲染成 ✗，避免静默显示"—"查不出原因）
+	let opencodeUsage: OpencodeUsage | null = null;
+	let opencodeUsageAt = 0;
+	let opencodeUsageFailed = false; // 同 codexQuotaFailed：失败留痕 ✗
 	let auth: AuthInfo = { kind: "none" };
 	let balance: Balance | null = null;
 	let balanceAt = 0;
@@ -460,6 +510,30 @@ export default function hud(pi: ExtensionAPI) {
 			})
 			.catch(() => {
 				/* 余额查询失败不影响 HUD 其余部分 */
+			});
+	}
+
+	function maybeFetchOpencodeUsage(ctx: ExtensionContext): void {
+		if (ctx.model?.provider !== "opencode-go" || auth.kind !== "api_key" || !auth.apiKey) return;
+		if (Date.now() - opencodeUsageAt < OPENCODE_USAGE_TTL_MS) return;
+		opencodeUsageAt = Date.now();
+		fetch(OPENCODE_USAGE_URL, {
+			headers: { Authorization: `Bearer ${auth.apiKey}` },
+			signal: AbortSignal.timeout(5000),
+		})
+			.then((res) => (res.ok ? res.json() : null))
+			.then((json: unknown) => {
+				const parsed = parseOpencodeUsage(json);
+				if (parsed) {
+					opencodeUsage = parsed;
+					opencodeUsageFailed = false;
+					refresh(ctx);
+				}
+			})
+			.catch(() => {
+				// 同 codexQuotaFailed：失败留痕 ✗，下次上游 API 变动时能看出是查询失败
+				opencodeUsageFailed = true;
+				refresh(ctx);
 			});
 	}
 
@@ -518,7 +592,17 @@ export default function hud(pi: ExtensionAPI) {
 			seg1.push(`${t.fg("muted", "订阅")} ${quotaText}`);
 		} else {
 			if (auth.kind === "api_key") {
-				seg1.push(`${t.fg("muted", "API")} 余额 ${balance ? t.fg("success", fmtMoney(balance.amount, balance.currency)) : t.fg("dim", "—")}`);
+				if (ctx.model?.provider === "opencode-go") {
+					// opencode 网关无余额 API，改用官方用量接口（滚动/周/月 已用百分比）
+					const parts = opencodeUsage ? opencodeUsage.windows.map((w) => `${w.label}${w.usedPercent.toFixed(0)}%`) : null;
+					seg1.push(
+						parts && parts.length > 0
+							? `${t.fg("muted", "用量")} ${parts.join(t.fg("dim", " · "))}`
+							: `${t.fg("muted", "用量")} ${opencodeUsageFailed ? t.fg("error", "✗") : t.fg("dim", "—")}`,
+					);
+				} else {
+					seg1.push(`${t.fg("muted", "API")} 余额 ${balance ? t.fg("success", fmtMoney(balance.amount, balance.currency)) : t.fg("dim", "—")}`);
+				}
 			}
 			const sessionCost = fmtSessionCost(cnyCost, uncoveredUsd);
 			if (sessionCost !== null) seg1.push(`本次 ${t.fg("warning", sessionCost)}`);
@@ -586,6 +670,7 @@ export default function hud(pi: ExtensionAPI) {
 		if (ctx.model) auth = readAuthInfo(authPath, ctx.model.provider);
 		maybeFetchBalance(ctx);
 		maybeFetchCodexQuota(ctx);
+		maybeFetchOpencodeUsage(ctx);
 		refresh(ctx);
 	});
 
@@ -596,8 +681,12 @@ export default function hud(pi: ExtensionAPI) {
 		codexQuota = null;
 		codexQuotaAt = 0;
 		codexQuotaFailed = false;
+		opencodeUsage = null;
+		opencodeUsageAt = 0;
+		opencodeUsageFailed = false;
 		maybeFetchBalance(ctx);
 		maybeFetchCodexQuota(ctx);
+		maybeFetchOpencodeUsage(ctx);
 		refresh(ctx);
 	});
 
@@ -620,6 +709,7 @@ export default function hud(pi: ExtensionAPI) {
 		stopTimer();
 		maybeFetchBalance(ctx);
 		maybeFetchCodexQuota(ctx);
+		maybeFetchOpencodeUsage(ctx);
 		refresh(ctx);
 	});
 
