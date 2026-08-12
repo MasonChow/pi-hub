@@ -24,6 +24,7 @@ import {
 	parseCodexUsage,
 	parseDeepseekBalance,
 	parseMoonshotBalance,
+	parseOpencodeUsage,
 	parseStepfunBalance,
 	readAuthInfo,
 	recordSubagentResults,
@@ -169,6 +170,42 @@ test("fmtWindowLabel", () => {
 	assert.equal(fmtWindowLabel(1800), "30m");
 	assert.equal(fmtWindowLabel(undefined), "窗口");
 	assert.equal(fmtWindowLabel(0), "窗口");
+});
+
+// 真实抓包样本：GET https://opencode.ai/zen/go/v1/usage 带 api key 的响应
+// （rolling 为滚动窗口，weekly/monthly 为周/月配额，percent 为已用百分比）
+test("parseOpencodeUsage: 真实抓包样本（滚动/周/月 三窗口）", () => {
+	const u = parseOpencodeUsage({
+		usage: {
+			rolling: { status: "ok", percent: 0, resetsAt: "2026-08-12T07:03:44.611Z" },
+			weekly: { status: "ok", percent: 7, resetsAt: "2026-08-17T00:00:00.611Z" },
+			monthly: { status: "ok", percent: 4, resetsAt: "2026-09-07T03:01:04.611Z" },
+		},
+	});
+	assert.ok(u);
+	assert.equal(u.windows.length, 3);
+	assert.deepEqual(u.windows.map((w) => w.label), ["滚动", "周", "月"]);
+	assert.deepEqual(u.windows.map((w) => w.usedPercent), [0, 7, 4]);
+});
+
+test("parseOpencodeUsage: status 非 ok 的窗口跳过 / 脏输入", () => {
+	// rolling 被限流（status != "ok"），只保留 weekly
+	const u = parseOpencodeUsage({
+		usage: {
+			rolling: { status: "exhausted", percent: 100 },
+			weekly: { status: "ok", percent: 50, resetsAt: "2026-08-17T00:00:00.000Z" },
+		},
+	});
+	assert.ok(u);
+	assert.equal(u.windows.length, 1);
+	assert.equal(u.windows[0].label, "周");
+	assert.equal(u.windows[0].usedPercent, 50);
+	// 一个窗口都解析不出 → null
+	assert.equal(parseOpencodeUsage({ usage: {} }), null);
+	assert.equal(parseOpencodeUsage({ usage: { rolling: { status: "ok", percent: "abc" } } }), null);
+	assert.equal(parseOpencodeUsage({}), null);
+	assert.equal(parseOpencodeUsage(null), null);
+	assert.equal(parseOpencodeUsage("garbage"), null);
 });
 
 test("parseDeepseekBalance", () => {
