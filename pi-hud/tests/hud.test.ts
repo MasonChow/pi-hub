@@ -13,6 +13,7 @@ import {
 	addUsage,
 	bar,
 	cacheHitRate,
+	ctxAlive,
 	emptyAgg,
 	exactCnyCost,
 	fmtCost,
@@ -31,6 +32,38 @@ import {
 	summarizeSubagents,
 	type SubagentRecord,
 } from "../src/index.ts";
+
+// 回归：issue #13 —— 会话替换/reload 后 ctx 的 getter 会抛 assertActive，
+// HUD 异步回调 / 定时器持有旧 ctx 时必须能探测出 stale 并静默跳过
+// （否则异常冒泡到 workflow 层，把已完成的 subagent run 误标 failed）。
+test("ctxAlive: 正常 ctx 判定为存活", () => {
+	const alive = {
+		get hasUI() {
+			return true;
+		},
+	};
+	assert.equal(ctxAlive(alive as never), true);
+});
+
+test("ctxAlive: stale ctx（getter 抛 assertActive）判定为失效", () => {
+	const stale = {
+		get hasUI() {
+			throw new Error("This extension ctx is stale after session replacement or reload.");
+		},
+	};
+	assert.equal(ctxAlive(stale as never), false);
+});
+
+// 补充：无 UI 的 headless 会话 ctx.hasUI 返回 false 但不抛，应仍判定存活
+// （HUD 只是据此不做渲染，不意味着 ctx 失效）。
+test("ctxAlive: headless ctx（hasUI=false 但不抛）仍存活", () => {
+	const headless = {
+		get hasUI() {
+			return false;
+		},
+	};
+	assert.equal(ctxAlive(headless as never), true);
+});
 
 test("fmtTokens", () => {
 	assert.equal(fmtTokens(0), "0");
