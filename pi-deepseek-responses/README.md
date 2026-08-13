@@ -73,10 +73,10 @@ DeepSeek 自己管理上下文缓存，因此扩展会把 Pi 的 Responses cache
 
 ## 当前模型支持
 
-截至 2026-08-08，DeepSeek 官方 Responses 文档明确写明：
+截至 2026-08-13，DeepSeek 官方 Responses 文档明确写明：
 
 - `deepseek-v4-flash`：支持 Responses API → 本扩展路由到 `/responses` + native `web_search`
-- `deepseek-v4-pro`：暂未支持 Responses API → 本扩展保留 Pi 原 `/chat/completions`
+- `deepseek-v4-pro`：支持 Responses API（2026-08-13 起开放）→ 本扩展路由到 `/responses` + native `web_search`
 - 其他未知 DeepSeek 模型：默认保留 Pi 原 Chat Completions transport
 
 Responses 能力采用显式 allowlist，避免新/旧 catalog 模型因服务端尚未开放 `/responses` 而回归失败。DeepSeek 官方新增 Responses 模型后，需要把对应 model id 加入 `DEEPSEEK_RESPONSES_MODELS` 并发布新版扩展。
@@ -94,10 +94,10 @@ Responses 路径：
 [pi-deepseek-responses] request tools=function,function,web_search
 ```
 
-Fallback 路径：
+Fallback 路径（未知 / 尚未开放 Responses 的模型）：
 
 ```text
-[pi-deepseek-responses] provider=deepseek model=deepseek-v4-pro api=openai-completions responses=unsupported
+[pi-deepseek-responses] provider=deepseek model=future-model api=openai-completions responses=unsupported
 ```
 
 不会打印 API key 或完整 prompt。
@@ -133,7 +133,7 @@ PI_DEEPSEEK_RESPONSES_DEBUG=1 \
 PI_DEEPSEEK_RESPONSES_DEBUG=1 \
   ./node_modules/.bin/pi -e ./src/index.ts --provider deepseek --model deepseek-v4-pro \
   -p --no-session --no-tools \
-  "用一句话回答：2+2等于几？"
+  "搜索今天 Pi coding agent 的最新版本变化，并给出来源"
 ```
 
 期望 debug 行：
@@ -142,5 +142,5 @@ PI_DEEPSEEK_RESPONSES_DEBUG=1 \
 # flash
 api=openai-responses web_search=enabled
 # pro
-api=openai-completions responses=unsupported
+api=openai-responses web_search=enabled
 ```
