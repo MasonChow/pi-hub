@@ -14,7 +14,7 @@ import {
   streamSimpleOpenAIResponses as defaultStreamOpenAIResponses,
 } from "@earendil-works/pi-ai/compat";
 
-const DEEPSEEK_RESPONSES_MODELS = new Set(["deepseek-v4-flash"]);
+const DEEPSEEK_RESPONSES_MODELS = new Set(["deepseek-v4-flash", "deepseek-v4-pro"]);
 
 const UNSUPPORTED_TOP_LEVEL_FIELDS = [
   "store",

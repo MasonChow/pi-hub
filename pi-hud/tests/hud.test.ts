@@ -182,6 +182,7 @@ test("fmtWindowLabel", () => {
 	assert.equal(fmtWindowLabel(0), "窗口");
 });
 
+// 真实抓包样本：GET https://opencode.ai/zen/go/v1/usage 带 api key 的响应
 test("parseDeepseekBalance", () => {
 	const b = parseDeepseekBalance({
 		is_available: true,

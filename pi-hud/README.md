@@ -39,8 +39,8 @@ pi install npm:@masonchow/pi-hud
 
 查询顺序：
 
-1. **官方** `GET https://opencode.ai/zen/go/v1/usage` + Bearer API key（上游上线后自动生效）
-2. **Dashboard scrape** `https://opencode.ai/workspace/{id}/go`（当前可用）
+1. **官方** `GET https://opencode.ai/zen/go/v1/usage` + Bearer API key（已上线，真实抓包验证）
+2. **Dashboard scrape** `https://opencode.ai/workspace/{id}/go`（官方 API 失败时的回退）
 
 Scrape 凭据解析（**按序填缺**：已有字段不再被后面覆盖）：
 

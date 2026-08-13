@@ -1,9 +1,9 @@
 /**
  * OpenCode Go 订阅额度：官方 API（优先）+ dashboard scrape 回退。
  *
- * 官方 `GET /zen/go/v1/usage` 截至 2026-08 仍未上线（issue #16017 / PR #16513），
- * 实测 404。当前可用数据源是 workspace dashboard HTML（SSR 里嵌了
- * rollingUsage / weeklyUsage / monthlyUsage）。
+ * 官方 `GET /zen/go/v1/usage` 已上线（真实抓包验证），优先使用；失败时
+ * 回退到 workspace dashboard HTML（SSR 里嵌了 rollingUsage / weeklyUsage /
+ * monthlyUsage）。
  *
  * 凭据解析顺序（后者仅在前者缺失时补齐）：
  * 1. ~/.pi/agent/opencode-go-quota.json（workspaceId / authCookie）

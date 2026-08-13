@@ -6,10 +6,7 @@
  *   /formula-tires   — view configured tire roster (what box can pick)
  *   /boxbox          — Box box! assess switch (difficulty + thrift + cost + confirm → setModel)
  *
- * Auto:
- *   - quality: negative signals (corrections / tool fails / explicit intent)
- *   - economy: calm session + overprovisioned tire → thrift downshift
- * Volume (turns/context/time) only raises heat, never sole auto-trigger for upgrades.
+ * Manual only: /boxbox assesses on demand; nothing auto-triggers during a session.
  *
  * Install: pi install npm:@masonchow/pi-agent-formula
  */
@@ -64,10 +61,11 @@ import {
 	type Suggestion,
 } from "./suggest.ts";
 import {
-	computeEconomyFire,
 	computeEconomyOpportunity,
+	type EconomyFire,
 } from "./thrift.ts";
 import {
+	canBreakCooldown,
 	enterCooldown,
 	isInCooldown,
 	type CooldownKind,
@@ -271,7 +269,8 @@ function makeSuggestion(
 	config: FormulaConfig,
 	snap: SessionSignalSnapshot,
 	judge: JudgeVerdict | null,
-	opts: { manual: boolean; fit: FitAssessment },
+	fit: FitAssessment,
+	auto = false,
 ): Suggestion {
 	const heat = computeHeat(snap);
 	const negative = computeNegativeFire(snap);
@@ -280,21 +279,23 @@ function makeSuggestion(
 	const auth = cur
 		? readProviderAuthKind(defaultAuthPath(), cur.provider)
 		: "none";
-	const economy = opts.manual
-		? computeEconomyOpportunity(snap, negative, opts.fit, auth)
-		: computeEconomyFire(snap, negative, opts.fit, auth);
+	// Auto path never surfaces economy (thrift is manual /boxbox only — see #6
+	// UX lesson). Negative set A is the sole auto trigger.
+	const economy: EconomyFire = auto
+		? { shouldFire: false, targetTire: null, reasons: [] }
+		: computeEconomyOpportunity(snap, negative, fit, auth);
 
 	// Provisional target for cost band: preferred tire from fit/economy/judge
 	const preferred =
 		judge?.tier ??
 		(negative.shouldFire
-			? opts.fit.direction === "upgrade"
-				? opts.fit.targetTire
+			? fit.direction === "upgrade"
+				? fit.targetTire
 				: "red"
 			: economy.shouldFire
 				? economy.targetTire
-				: opts.fit.direction === "upgrade"
-					? opts.fit.targetTire
+				: fit.direction === "upgrade"
+					? fit.targetTire
 					: null);
 	const pick = pickByTagPriority(
 		config,
@@ -316,9 +317,9 @@ function makeSuggestion(
 		snap,
 		heat,
 		negative,
-		fit: opts.fit,
+		fit,
 		economy,
-		allowMatchUpgrade: opts.manual,
+		allowMatchUpgrade: !auto,
 		judgeReason: judge?.reason ?? null,
 		judgeTier: judge?.tier ?? null,
 		judgeShouldSwitch: judge ? judge.shouldSwitch : null,
@@ -406,10 +407,32 @@ export default function (pi: ExtensionAPI) {
 	let turnsSinceSuggest = 999;
 	let nudgedMissingConfig = false;
 	let autoRunning = false;
-	let lastUserText = "";
 
 	function tracking() {
 		return { sessionStart, correctionStreak, toolFail, explicitSwitch };
+	}
+
+	/**
+	 * Record a presented suggestion: enter cooldown, reset the turn counter,
+	 * and consume the one-shot explicit switch intent.
+	 */
+	function recordSuggestion(
+		suggestion: Suggestion,
+		snap: SessionSignalSnapshot,
+		dismissed: boolean,
+	): void {
+		const reasons =
+			suggestion.mode === "economy"
+				? suggestion.fit?.reasons ?? ["economy"]
+				: computeNegativeFire(snap).reasons;
+		cooldown = enterCooldown(
+			Date.now(),
+			reasons.length ? reasons : [suggestion.mode],
+			dismissed,
+			cooldownKindFromSuggestion(suggestion),
+		);
+		turnsSinceSuggest = 0;
+		explicitSwitch = false;
 	}
 
 	// --- tools for conversational config ---
@@ -690,23 +713,10 @@ export default function (pi: ExtensionAPI) {
 			const fit = buildSessionFit(ctx, loaded.config, snap);
 			// Prefer async judge; fall back to rules (difficulty + thrift + quality)
 			const judge = await runJudge(ctx, loaded.config, snap, fit);
-			const suggestion = makeSuggestion(ctx, loaded.config, snap, judge, {
-				manual: true,
-				fit,
-			});
+			const suggestion = makeSuggestion(ctx, loaded.config, snap, judge, fit);
 
 			await presentSuggestion(pi, ctx, suggestion, (dismissed) => {
-				const reasons =
-					suggestion.mode === "economy"
-						? suggestion.fit?.reasons ?? ["economy"]
-						: computeNegativeFire(snap).reasons;
-				cooldown = enterCooldown(
-					Date.now(),
-					reasons.length ? reasons : [suggestion.mode],
-					dismissed,
-					cooldownKindFromSuggestion(suggestion),
-				);
-				turnsSinceSuggest = 0;
+				recordSuggestion(suggestion, snap, dismissed);
 			});
 		},
 	});
@@ -721,7 +731,6 @@ export default function (pi: ExtensionAPI) {
 		turnsSinceSuggest = 999;
 		nudgedMissingConfig = false;
 		autoRunning = false;
-		lastUserText = "";
 
 		// Catalogue consistency: remind only when configured models are missing from Pi.
 		const available = listAvailable(ctx);
@@ -732,7 +741,7 @@ export default function (pi: ExtensionAPI) {
 				"warning",
 			);
 		}
-		// consistent or missing/invalid: no startup spam (missing handled when /boxbox or auto)
+		// consistent or missing/invalid: no startup spam (missing handled when /boxbox runs)
 	});
 
 	pi.on("message_end", async (event) => {
@@ -740,9 +749,9 @@ export default function (pi: ExtensionAPI) {
 		if (msg.role === "user") {
 			const text = extractText(msg.content);
 			if (text.startsWith("[Agent Formula")) return;
-			lastUserText = text;
 			correctionStreak = nextCorrectionStreak(correctionStreak, text);
-			if (isExplicitSwitchIntent(text)) explicitSwitch = true;
+			// Reflect the latest user message: a non-switch message clears the one-shot intent.
+			explicitSwitch = isExplicitSwitchIntent(text);
 			turnsSinceSuggest += 1;
 		}
 	});
@@ -754,19 +763,16 @@ export default function (pi: ExtensionAPI) {
 		});
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
-		// Reset explicit flag after a turn unless last user message was explicit
-		// (keep until handled by auto fire once)
+	pi.on("agent_settled", async (_event, ctx) => {
 		void maybeAutoBox(ctx);
-		// clear one-shot explicit after evaluation window
-		if (explicitSwitch && !autoRunning) {
-			// keep until auto consumes or next non-explicit user message
-			if (lastUserText && !isExplicitSwitchIntent(lastUserText)) {
-				explicitSwitch = false;
-			}
-		}
 	});
 
+	/**
+	 * Auto mid-session suggestion: fires only on negative set A
+	 * (correction streak ≥ 2 / same-tool fail ≥ 2 / explicit switch intent).
+	 * Volume signals never trigger; economy stays manual /boxbox only (see #6
+	 * UX lesson). Missing/invalid config → at most one mild nudge per session.
+	 */
 	async function maybeAutoBox(ctx: ExtensionContext): Promise<void> {
 		if (autoRunning) return;
 
@@ -776,53 +782,54 @@ export default function (pi: ExtensionAPI) {
 		const available = listAvailable(ctx);
 		const loaded = loadFormulaConfig(configPath, available);
 
-		// Economy needs config+fit; quality negative can still nudge missing config.
+		// No valid config: auto path off; one mild nudge per session on pain.
 		if (loaded.status !== "ok") {
 			if (negative.shouldFire && !nudgedMissingConfig) {
 				nudgedMissingConfig = true;
-				ctx.ui.notify("Agent Formula 未配置：需要时运行 /formula-config", "info");
+				ctx.ui.notify(
+					"Agent Formula 未配置：检测到连续纠正/工具失败。需要自动换模建议时可运行 /formula-config。",
+					"info",
+				);
 			}
 			return;
 		}
 
-		const fit = buildSessionFit(ctx, loaded.config, snap);
-		const economy = computeEconomyFire(snap, negative, fit);
-		if (!negative.shouldFire && !economy.shouldFire) return;
+		if (!negative.shouldFire) return;
 
 		const now = Date.now();
 		if (isInCooldown(cooldown, now, turnsSinceSuggest)) {
-			// Quality / explicit can break economy cooldown; dismissed quality needs explicit.
-			const canBreak =
-				(snap.explicitSwitchIntent && cooldown?.dismissed) ||
-				(negative.shouldFire && cooldown?.kind === "economy");
-			if (!canBreak) return;
+			if (!canBreakCooldown(cooldown, negative, snap.explicitSwitchIntent)) return;
 		}
 
 		autoRunning = true;
 		try {
-			const config = loaded.config;
-			const reasons = negative.shouldFire ? negative.reasons : economy.reasons;
+			const fit = buildSessionFit(ctx, loaded.config, snap);
 			void (async () => {
 				try {
-					const judge = await runJudge(ctx, config, snap, fit);
-					const suggestion = makeSuggestion(ctx, config, snap, judge, {
-						manual: false,
+					// Judge is async fire-and-forget: never blocks the agent loop.
+					const judge = await runJudge(ctx, loaded.config, snap, fit);
+					const suggestion = makeSuggestion(
+						ctx,
+						loaded.config,
+						snap,
+						judge,
 						fit,
-					});
-					const kind = cooldownKindFromSuggestion(suggestion);
+						true,
+					);
+
 					if (!suggestion.shouldSwitch) {
-						cooldown = enterCooldown(Date.now(), reasons, true, kind);
-						turnsSinceSuggest = 0;
-						explicitSwitch = false;
+						recordSuggestion(suggestion, snap, true);
 						return;
 					}
+
+					// Agent became busy again while judge ran: notify only, no confirm.
 					if (!ctx.isIdle()) {
 						const modeZh =
-							suggestion.mode === "economy"
-								? "省耗降档"
+							suggestion.mode === "quality"
+								? "质量升档"
 								: suggestion.mode === "match"
 									? "难度升档"
-									: "质量升档";
+									: "省耗降档";
 						ctx.ui.notify(
 							`Agent Formula: 建议${modeZh} ${suggestion.tierName ?? ""} → ${
 								suggestion.target
@@ -831,14 +838,12 @@ export default function (pi: ExtensionAPI) {
 							}（${suggestion.reason.slice(0, 80)}）。空闲时运行 /boxbox 确认。`,
 							"warning",
 						);
-						cooldown = enterCooldown(Date.now(), reasons, false, kind);
-						turnsSinceSuggest = 0;
+						recordSuggestion(suggestion, snap, false);
 						return;
 					}
+
 					await presentSuggestion(pi, ctx, suggestion, (dismissed) => {
-						cooldown = enterCooldown(Date.now(), reasons, dismissed, kind);
-						turnsSinceSuggest = 0;
-						explicitSwitch = false;
+						recordSuggestion(suggestion, snap, dismissed);
 					});
 				} finally {
 					autoRunning = false;
@@ -848,4 +853,5 @@ export default function (pi: ExtensionAPI) {
 			autoRunning = false;
 		}
 	}
+
 }

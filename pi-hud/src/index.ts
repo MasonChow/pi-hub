@@ -535,12 +535,12 @@ export default function hud(pi: ExtensionAPI) {
 				goQuota = next.goQuota;
 				goQuotaFailed = next.goQuotaFailed;
 				goAuthExpired = next.goAuthExpired;
-				if (shouldNotifyGoAuthExpired(prevAuthExpired, goAuthExpired) && ctx.hasUI) {
-					try {
+				try {
+					if (shouldNotifyGoAuthExpired(prevAuthExpired, goAuthExpired) && ctx.hasUI) {
 						ctx.ui.notify(goAuthNotifyMessage(outcome.workspaceId), "warning");
-					} catch {
-						/* notify 失败不影响 HUD */
 					}
+				} catch {
+					/* stale ctx 或 notify 失败：静默跳过，不打断 agent（会话替换/reload 后异步回调） */
 				}
 				refresh(ctx);
 			})
