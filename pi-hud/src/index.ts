@@ -419,6 +419,24 @@ export function summarizeSubagents(
 	return [...byKey.values()];
 }
 
+/**
+ * 判断 ctx 是否已被 ExtensionRunner 标记为 stale（会话替换 / reload 之后）。
+ *
+ * pi 的 runner 在 invalidate 后会让 ctx 的每个 getter 抛 assertActive 异常，且没有
+ * 公开的 isActive() 探针，只能靠 try/catch 探测。HUD 的异步回调（余额/额度 fetch 完成）
+ * 和每秒定时器会跨会话持有旧 ctx，跨过会话边界后必须先自查，否则 stale 异常会从异步
+ * 回调里冒泡出去——已复现：subagent workflow 子会话正常完成后，`.catch` 里的 refresh
+ * 抛 `This extension ctx is stale...`，整个 run 被误标 failed，完成产物全部写回也白搭。
+ */
+export function ctxAlive(ctx: Pick<ExtensionContext, "hasUI">): boolean {
+	try {
+		void ctx.hasUI;
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 扩展入口
 // ---------------------------------------------------------------------------
@@ -654,15 +672,15 @@ export default function hud(pi: ExtensionAPI) {
 	}
 
 	function refresh(ctx: ExtensionContext): void {
-		if (!ctx.hasUI) return;
-		if (!enabled) {
-			ctx.ui.setWidget(WIDGET_ID, undefined);
-			return;
-		}
 		try {
+			if (!ctx.hasUI) return;
+			if (!enabled) {
+				ctx.ui.setWidget(WIDGET_ID, undefined);
+				return;
+			}
 			ctx.ui.setWidget(WIDGET_ID, buildLines(ctx), { placement: "belowEditor" });
 		} catch {
-			/* 渲染失败不打断 agent */
+			/* stale ctx（会话替换/reload 后异步回调触发）或渲染失败：静默跳过，不打断 agent */
 		}
 	}
 
@@ -701,7 +719,14 @@ export default function hud(pi: ExtensionAPI) {
 	pi.on("agent_start", async (_event, ctx) => {
 		runStart = Date.now();
 		stopTimer();
-		timer = setInterval(() => refresh(ctx), 1000); // 执行时间/流式速度的秒级走字
+		timer = setInterval(() => {
+			if (!ctxAlive(ctx)) {
+				// 会话已替换/结束，旧 ctx 失效：停表释放，避免每秒空转访问 stale ctx
+				stopTimer();
+				return;
+			}
+			refresh(ctx);
+		}, 1000); // 执行时间/流式速度的秒级走字
 		refresh(ctx);
 	});
 
