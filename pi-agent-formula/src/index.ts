@@ -62,9 +62,12 @@ import {
 } from "./suggest.ts";
 import {
 	computeEconomyOpportunity,
+	type EconomyFire,
 } from "./thrift.ts";
 import {
+	canBreakCooldown,
 	enterCooldown,
+	isInCooldown,
 	type CooldownKind,
 	type CooldownState,
 } from "./cooldown.ts";
@@ -267,6 +270,7 @@ function makeSuggestion(
 	snap: SessionSignalSnapshot,
 	judge: JudgeVerdict | null,
 	fit: FitAssessment,
+	auto = false,
 ): Suggestion {
 	const heat = computeHeat(snap);
 	const negative = computeNegativeFire(snap);
@@ -275,7 +279,11 @@ function makeSuggestion(
 	const auth = cur
 		? readProviderAuthKind(defaultAuthPath(), cur.provider)
 		: "none";
-	const economy = computeEconomyOpportunity(snap, negative, fit, auth);
+	// Auto path never surfaces economy (thrift is manual /boxbox only — see #6
+	// UX lesson). Negative set A is the sole auto trigger.
+	const economy: EconomyFire = auto
+		? { shouldFire: false, targetTire: null, reasons: [] }
+		: computeEconomyOpportunity(snap, negative, fit, auth);
 
 	// Provisional target for cost band: preferred tire from fit/economy/judge
 	const preferred =
@@ -311,7 +319,7 @@ function makeSuggestion(
 		negative,
 		fit,
 		economy,
-		allowMatchUpgrade: true,
+		allowMatchUpgrade: !auto,
 		judgeReason: judge?.reason ?? null,
 		judgeTier: judge?.tier ?? null,
 		judgeShouldSwitch: judge ? judge.shouldSwitch : null,
@@ -396,9 +404,35 @@ export default function (pi: ExtensionAPI) {
 	let toolFail = { tool: null as string | null, streak: 0 };
 	let explicitSwitch = false;
 	let cooldown: CooldownState | null = null;
+	let turnsSinceSuggest = 999;
+	let nudgedMissingConfig = false;
+	let autoRunning = false;
 
 	function tracking() {
 		return { sessionStart, correctionStreak, toolFail, explicitSwitch };
+	}
+
+	/**
+	 * Record a presented suggestion: enter cooldown, reset the turn counter,
+	 * and consume the one-shot explicit switch intent.
+	 */
+	function recordSuggestion(
+		suggestion: Suggestion,
+		snap: SessionSignalSnapshot,
+		dismissed: boolean,
+	): void {
+		const reasons =
+			suggestion.mode === "economy"
+				? suggestion.fit?.reasons ?? ["economy"]
+				: computeNegativeFire(snap).reasons;
+		cooldown = enterCooldown(
+			Date.now(),
+			reasons.length ? reasons : [suggestion.mode],
+			dismissed,
+			cooldownKindFromSuggestion(suggestion),
+		);
+		turnsSinceSuggest = 0;
+		explicitSwitch = false;
 	}
 
 	// --- tools for conversational config ---
@@ -682,18 +716,7 @@ export default function (pi: ExtensionAPI) {
 			const suggestion = makeSuggestion(ctx, loaded.config, snap, judge, fit);
 
 			await presentSuggestion(pi, ctx, suggestion, (dismissed) => {
-				const reasons =
-					suggestion.mode === "economy"
-						? suggestion.fit?.reasons ?? ["economy"]
-						: computeNegativeFire(snap).reasons;
-				cooldown = enterCooldown(
-					Date.now(),
-					reasons.length ? reasons : [suggestion.mode],
-					dismissed,
-					cooldownKindFromSuggestion(suggestion),
-				);
-				// One-shot explicit intent is consumed by this manual assessment.
-				explicitSwitch = false;
+				recordSuggestion(suggestion, snap, dismissed);
 			});
 		},
 	});
@@ -705,6 +728,9 @@ export default function (pi: ExtensionAPI) {
 		toolFail = { tool: null, streak: 0 };
 		explicitSwitch = false;
 		cooldown = null;
+		turnsSinceSuggest = 999;
+		nudgedMissingConfig = false;
+		autoRunning = false;
 
 		// Catalogue consistency: remind only when configured models are missing from Pi.
 		const available = listAvailable(ctx);
@@ -724,7 +750,9 @@ export default function (pi: ExtensionAPI) {
 			const text = extractText(msg.content);
 			if (text.startsWith("[Agent Formula")) return;
 			correctionStreak = nextCorrectionStreak(correctionStreak, text);
-			if (isExplicitSwitchIntent(text)) explicitSwitch = true;
+			// Reflect the latest user message: a non-switch message clears the one-shot intent.
+			explicitSwitch = isExplicitSwitchIntent(text);
+			turnsSinceSuggest += 1;
 		}
 	});
 
@@ -734,5 +762,96 @@ export default function (pi: ExtensionAPI) {
 			failed: event.isError === true,
 		});
 	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		void maybeAutoBox(ctx);
+	});
+
+	/**
+	 * Auto mid-session suggestion: fires only on negative set A
+	 * (correction streak ≥ 2 / same-tool fail ≥ 2 / explicit switch intent).
+	 * Volume signals never trigger; economy stays manual /boxbox only (see #6
+	 * UX lesson). Missing/invalid config → at most one mild nudge per session.
+	 */
+	async function maybeAutoBox(ctx: ExtensionContext): Promise<void> {
+		if (autoRunning) return;
+
+		const snap = buildSnapshot(ctx, tracking());
+		const negative = computeNegativeFire(snap);
+
+		const available = listAvailable(ctx);
+		const loaded = loadFormulaConfig(configPath, available);
+
+		// No valid config: auto path off; one mild nudge per session on pain.
+		if (loaded.status !== "ok") {
+			if (negative.shouldFire && !nudgedMissingConfig) {
+				nudgedMissingConfig = true;
+				ctx.ui.notify(
+					"Agent Formula 未配置：检测到连续纠正/工具失败。需要自动换模建议时可运行 /formula-config。",
+					"info",
+				);
+			}
+			return;
+		}
+
+		if (!negative.shouldFire) return;
+
+		const now = Date.now();
+		if (isInCooldown(cooldown, now, turnsSinceSuggest)) {
+			if (!canBreakCooldown(cooldown, negative, snap.explicitSwitchIntent)) return;
+		}
+
+		autoRunning = true;
+		try {
+			const fit = buildSessionFit(ctx, loaded.config, snap);
+			void (async () => {
+				try {
+					// Judge is async fire-and-forget: never blocks the agent loop.
+					const judge = await runJudge(ctx, loaded.config, snap, fit);
+					const suggestion = makeSuggestion(
+						ctx,
+						loaded.config,
+						snap,
+						judge,
+						fit,
+						true,
+					);
+
+					if (!suggestion.shouldSwitch) {
+						recordSuggestion(suggestion, snap, true);
+						return;
+					}
+
+					// Agent became busy again while judge ran: notify only, no confirm.
+					if (!ctx.isIdle()) {
+						const modeZh =
+							suggestion.mode === "quality"
+								? "质量升档"
+								: suggestion.mode === "match"
+									? "难度升档"
+									: "省耗降档";
+						ctx.ui.notify(
+							`Agent Formula: 建议${modeZh} ${suggestion.tierName ?? ""} → ${
+								suggestion.target
+									? modelKey(suggestion.target.provider, suggestion.target.model)
+									: "?"
+							}（${suggestion.reason.slice(0, 80)}）。空闲时运行 /boxbox 确认。`,
+							"warning",
+						);
+						recordSuggestion(suggestion, snap, false);
+						return;
+					}
+
+					await presentSuggestion(pi, ctx, suggestion, (dismissed) => {
+						recordSuggestion(suggestion, snap, dismissed);
+					});
+				} finally {
+					autoRunning = false;
+				}
+			})();
+		} catch {
+			autoRunning = false;
+		}
+	}
 
 }

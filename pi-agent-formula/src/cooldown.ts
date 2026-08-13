@@ -48,3 +48,20 @@ export function enterCooldown(
 		kind,
 	};
 }
+
+/**
+ * Whether an auto suggestion may break an active cooldown early.
+ * - explicit switch intent re-fires even after a dismiss (user asked again)
+ * - quality negative fire breaks an economy cooldown (pain outweighs thrift quiet)
+ * Volume / repeated identical pain never breaks (that is the cooldown's job).
+ */
+export function canBreakCooldown(
+	state: CooldownState | null,
+	negative: { shouldFire: boolean },
+	explicitSwitchIntent: boolean,
+): boolean {
+	if (!state) return false;
+	if (explicitSwitchIntent && state.dismissed) return true;
+	if (negative.shouldFire && state.kind === "economy") return true;
+	return false;
+}
