@@ -35,6 +35,7 @@ import { estimateSwitchCostBand, ratesFromModelCost } from "../src/cost.ts";
 import {
 	enterCooldown,
 	isInCooldown,
+	canBreakCooldown,
 	DEFAULT_COOLDOWN_MS,
 	DEFAULT_COOLDOWN_TURNS,
 } from "../src/cooldown.ts";
@@ -662,6 +663,27 @@ test("isInCooldown", () => {
 	const state = enterCooldown(now, ["x"], true);
 	assert.equal(isInCooldown(state, now + 1000, 0), true);
 	assert.equal(isInCooldown(state, now + DEFAULT_COOLDOWN_MS + 1, DEFAULT_COOLDOWN_TURNS), false);
+});
+
+test("canBreakCooldown: explicit breaks dismissed; quality breaks economy only", () => {
+	const now = 1_000_000;
+	// no cooldown → nothing to break
+	assert.equal(canBreakCooldown(null, { shouldFire: true }, true), false);
+
+	// dismissed quality cooldown: only explicit switch intent breaks it
+	const dismissed = enterCooldown(now, ["连续纠正"], true, "quality");
+	assert.equal(canBreakCooldown(dismissed, { shouldFire: true }, false), false);
+	assert.equal(canBreakCooldown(dismissed, { shouldFire: true }, true), true);
+
+	// active economy cooldown: quality pain breaks it (pain > thrift quiet)
+	const economy = enterCooldown(now, ["省耗降档"], false, "economy");
+	assert.equal(canBreakCooldown(economy, { shouldFire: true }, false), true);
+	// economy cooldown without negative fire is never broken
+	assert.equal(canBreakCooldown(economy, { shouldFire: false }, false), false);
+
+	// undismissed quality cooldown: repeated identical pain does not break
+	const quality = enterCooldown(now, ["连续纠正"], false, "quality");
+	assert.equal(canBreakCooldown(quality, { shouldFire: true }, false), false);
 });
 
 test("within-tier match: oauth before api_key, then faster", () => {
