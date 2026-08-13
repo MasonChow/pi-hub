@@ -112,7 +112,7 @@ test("Responses capability is explicitly gated by official provider and supporte
   );
   assert.equal(
     supportsDeepSeekResponses({ provider: "deepseek", id: "deepseek-v4-pro" }),
-    false,
+    true,
   );
   assert.equal(
     supportsDeepSeekResponses({ provider: "openrouter", id: "deepseek-v4-flash" }),
@@ -152,7 +152,7 @@ test("extension overrides only the existing deepseek transport dispatcher", () =
   assert.equal("baseUrl" in registration.config, false);
 });
 
-test("streamDeepSeekTransport routes flash to Responses and unsupported models to Completions", () => {
+test("streamDeepSeekTransport routes Responses-capable models to Responses and unknown models to Completions", () => {
   const { adapters, calls } = mockAdapters();
 
   const flashResult = streamDeepSeekTransport(
@@ -175,14 +175,15 @@ test("streamDeepSeekTransport routes flash to Responses and unsupported models t
   );
 
   assert.equal(flashResult, "responses-stream");
-  assert.equal(proResult, "completions-stream");
+  assert.equal(proResult, "responses-stream");
   assert.equal(unknownResult, "completions-stream");
-  assert.equal(calls.responses.length, 1);
-  assert.equal(calls.completions.length, 2);
+  assert.equal(calls.responses.length, 2);
+  assert.equal(calls.completions.length, 1);
   assert.equal(calls.responses[0]?.model.api, "openai-responses");
   assert.equal(calls.responses[0]?.model.id, "deepseek-v4-flash");
-  assert.equal(calls.completions[0]?.model.id, "deepseek-v4-pro");
-  assert.equal(calls.completions[1]?.model.id, "future-model");
+  assert.equal(calls.responses[1]?.model.api, "openai-responses");
+  assert.equal(calls.responses[1]?.model.id, "deepseek-v4-pro");
+  assert.equal(calls.completions[0]?.model.id, "future-model");
 });
 
 test("Responses path forces cacheRetention none and re-sanitizes after upstream onPayload", async () => {
