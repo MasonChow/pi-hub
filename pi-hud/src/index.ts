@@ -6,6 +6,7 @@
  *   - api_key：供应商余额（有查询 API 的才显示：deepseek / kimi / stepfun）+ 本 session 已消耗成本
  *   - oauth 订阅：剩余额度（openai-codex 走 GET .../backend-api/wham/usage，
  *     token 经 AuthStorage 带锁刷新，详见下方"订阅额度"小节的注释）
+ *   - opencode-go：Go 订阅三窗口额度（5h / 周 / 月；官方 API 优先，否则 dashboard scrape）
  * - context 用量：进度条 + tokens / contextWindow（来自 ctx.getContextUsage()）
  * - agent 执行时间（累计活跃时长，运行中每秒刷新）+ token 输出速度（流式实时估算，
  *   message_end 后以真实 usage 校准）
@@ -23,6 +24,33 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	applyGoQuotaFetchResult,
+	fetchOpencodeGoQuota,
+	goAuthNotifyMessage,
+	goQuotaWindowEntries,
+	shouldNotifyGoAuthExpired,
+	type GoQuota,
+} from "./opencode-go.ts";
+
+// 重导出，供测试与外部直接引用
+export {
+	applyGoQuotaFetchResult,
+	classifyDashboardAuthFailure,
+	classifyGoWindowName,
+	formatGoQuotaStatusText,
+	GO_AUTH_LOGIN_URL,
+	GO_AUTH_NOTIFY_MESSAGE,
+	goAuthNotifyMessage,
+	goQuotaWindowEntries,
+	parseOpencodeGoDashboardHtml,
+	parseOpencodeGoUsage,
+	resolveOpencodeGoQuotaConfig,
+	shouldNotifyGoAuthExpired,
+	type GoQuota,
+	type GoQuotaFetchOutcome,
+	type GoQuotaWindow,
+} from "./opencode-go.ts";
 
 // readStoredCredential 只在实际需要读 codex token 时动态 import：
 // 顶层 import 会让 `node --test` 直接对该模块做 Node 原生 ESM 解析，而
@@ -247,51 +275,6 @@ export function fmtWindowLabel(seconds: number | undefined): string {
 	return `${Math.round(seconds / 86400)}d`;
 }
 
-// --- opencode 网关用量（opencode-go） -----------------------------------------
-//
-// opencode.ai zen 网关（baseUrl https://opencode.ai/zen/go/v1）没有余额查询接口，
-// 但有官方用量接口（真实抓包验证）：
-//   GET {baseUrl}/usage
-//   Authorization: Bearer <api key>
-// 响应形如：
-//   { "usage": { "rolling": { "status": "ok", "percent": 0, "resetsAt": "..." },
-//                 "weekly":  { "status": "ok", "percent": 7, "resetsAt": "..." },
-//                 "monthly": { "status": "ok", "percent": 4, "resetsAt": "..." } } }
-// percent 是各窗口已用百分比；status 非 "ok"（如被限流）的窗口跳过。
-
-export interface OpencodeWindow {
-	label: string;
-	usedPercent: number;
-}
-
-export interface OpencodeUsage {
-	windows: OpencodeWindow[];
-}
-
-const OPENCODE_WINDOW_LABELS: Record<string, string> = {
-	rolling: "滚动",
-	weekly: "周",
-	monthly: "月",
-};
-
-/** 解析 GET .../usage 的响应体；一个窗口都解析不出时返回 null */
-export function parseOpencodeUsage(json: unknown): OpencodeUsage | null {
-	if (typeof json !== "object" || json === null) return null;
-	const usage = (json as Record<string, unknown>).usage;
-	if (typeof usage !== "object" || usage === null) return null;
-	const windows: OpencodeWindow[] = [];
-	for (const [key, label] of Object.entries(OPENCODE_WINDOW_LABELS)) {
-		const w = (usage as Record<string, unknown>)[key];
-		if (typeof w !== "object" || w === null) continue;
-		const rec = w as Record<string, unknown>;
-		if (rec.status !== "ok") continue;
-		const percent = Number(rec.percent);
-		if (!Number.isFinite(percent)) continue;
-		windows.push({ label, usedPercent: percent });
-	}
-	return windows.length > 0 ? { windows } : null;
-}
-
 // --- API key 余额 -----------------------------------------------------------
 
 export interface Balance {
@@ -461,9 +444,9 @@ export function ctxAlive(ctx: Pick<ExtensionContext, "hasUI">): boolean {
 const WIDGET_ID = "hud";
 const BALANCE_TTL_MS = 5 * 60 * 1000;
 const CODEX_QUOTA_TTL_MS = 5 * 60 * 1000;
-const OPENCODE_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
-const OPENCODE_USAGE_TTL_MS = 5 * 60 * 1000;
+const GO_QUOTA_TTL_MS = 5 * 60 * 1000;
 const STREAM_REFRESH_MS = 300;
+const OPENCODE_GO_PROVIDER = "opencode-go";
 
 export default function hud(pi: ExtensionAPI) {
 	let enabled = true;
@@ -475,9 +458,10 @@ export default function hud(pi: ExtensionAPI) {
 	let codexQuota: CodexQuota | null = null;
 	let codexQuotaAt = 0;
 	let codexQuotaFailed = false; // 上一次查询失败（渲染成 ✗，避免静默显示"—"查不出原因）
-	let opencodeUsage: OpencodeUsage | null = null;
-	let opencodeUsageAt = 0;
-	let opencodeUsageFailed = false; // 同 codexQuotaFailed：失败留痕 ✗
+	let goQuota: GoQuota | null = null;
+	let goQuotaAt = 0;
+	let goQuotaFailed = false;
+	let goAuthExpired = false; // cookie/登录页失效，需用户重登
 	let auth: AuthInfo = { kind: "none" };
 	let balance: Balance | null = null;
 	let balanceAt = 0;
@@ -485,7 +469,8 @@ export default function hud(pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | null = null;
 	let lastStreamRefresh = 0;
 
-	const authPath = path.join(os.homedir(), ".pi", "agent", "auth.json");
+	const agentDir = path.join(os.homedir(), ".pi", "agent");
+	const authPath = path.join(agentDir, "auth.json");
 
 	/**
 	 * 逐条消息各自判断能不能查到官方 CNY 价目表：能查到的精确累加进 cnyCost，
@@ -531,30 +516,6 @@ export default function hud(pi: ExtensionAPI) {
 			});
 	}
 
-	function maybeFetchOpencodeUsage(ctx: ExtensionContext): void {
-		if (ctx.model?.provider !== "opencode-go" || auth.kind !== "api_key" || !auth.apiKey) return;
-		if (Date.now() - opencodeUsageAt < OPENCODE_USAGE_TTL_MS) return;
-		opencodeUsageAt = Date.now();
-		fetch(OPENCODE_USAGE_URL, {
-			headers: { Authorization: `Bearer ${auth.apiKey}` },
-			signal: AbortSignal.timeout(5000),
-		})
-			.then((res) => (res.ok ? res.json() : null))
-			.then((json: unknown) => {
-				const parsed = parseOpencodeUsage(json);
-				if (parsed) {
-					opencodeUsage = parsed;
-					opencodeUsageFailed = false;
-					refresh(ctx);
-				}
-			})
-			.catch(() => {
-				// 同 codexQuotaFailed：失败留痕 ✗，下次上游 API 变动时能看出是查询失败
-				opencodeUsageFailed = true;
-				refresh(ctx);
-			});
-	}
-
 	function maybeFetchCodexQuota(ctx: ExtensionContext): void {
 		if (ctx.model?.provider !== "openai-codex" || auth.kind !== "oauth") return;
 		if (Date.now() - codexQuotaAt < CODEX_QUOTA_TTL_MS) return;
@@ -579,6 +540,37 @@ export default function hud(pi: ExtensionAPI) {
 		});
 	}
 
+	function maybeFetchOpencodeGoQuota(ctx: ExtensionContext): void {
+		if (ctx.model?.provider !== OPENCODE_GO_PROVIDER) return;
+		if (Date.now() - goQuotaAt < GO_QUOTA_TTL_MS) return;
+		goQuotaAt = Date.now();
+		const apiKey = auth.kind === "api_key" ? auth.apiKey : undefined;
+		const prevAuthExpired = goAuthExpired;
+		// fetch 全链路 async（含 Chrome Keychain），不阻塞 agent 主循环
+		fetchOpencodeGoQuota({ apiKey, agentDir })
+			.then((outcome) => {
+				const next = applyGoQuotaFetchResult(goQuota, outcome);
+				goQuota = next.goQuota;
+				goQuotaFailed = next.goQuotaFailed;
+				goAuthExpired = next.goAuthExpired;
+				try {
+					if (shouldNotifyGoAuthExpired(prevAuthExpired, goAuthExpired) && ctx.hasUI) {
+						ctx.ui.notify(goAuthNotifyMessage(outcome.workspaceId), "warning");
+					}
+				} catch {
+					/* stale ctx 或 notify 失败：静默跳过，不打断 agent（会话替换/reload 后异步回调） */
+				}
+				refresh(ctx);
+			})
+			.catch(() => {
+				const next = applyGoQuotaFetchResult(goQuota, { quota: null, reason: "unavailable" });
+				goQuota = next.goQuota;
+				goQuotaFailed = next.goQuotaFailed;
+				goAuthExpired = next.goAuthExpired;
+				refresh(ctx);
+			});
+	}
+
 	function buildLines(ctx: ExtensionContext): string[] {
 		const t = ctx.ui.theme;
 		const sep = t.fg("dim", " │ ");
@@ -588,7 +580,29 @@ export default function hud(pi: ExtensionAPI) {
 		// ── 第 1 行：主 agent + 认证形态 ──
 		const modelLabel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "no model";
 		const seg1: string[] = [`${t.fg("accent", "λ")} ${t.fg("accent", modelLabel)}`];
-		if (auth.kind === "oauth") {
+		const isOpencodeGo = ctx.model?.provider === OPENCODE_GO_PROVIDER;
+		if (isOpencodeGo) {
+			// Go 是 api_key 存盘但产品是订阅三窗口，不走余额分支
+			const goParts: string[] = [];
+			for (const { label, window: w } of goQuota ? goQuotaWindowEntries(goQuota) : []) {
+				const left = Math.max(0, 100 - w.usedPercent);
+				let s = `${label} 剩 ${left.toFixed(0)}%`;
+				if (w.resetsInSeconds !== undefined) s += t.fg("dim", ` (重置 ${fmtDuration(w.resetsInSeconds * 1000)})`);
+				goParts.push(s);
+			}
+			const quotaText =
+				goParts.length > 0
+					? goParts.join(t.fg("dim", " · "))
+					: goAuthExpired
+						? t.fg("error", "额度 ✗ 需重登")
+						: goQuotaFailed
+							? t.fg("error", "额度 ✗")
+							: t.fg("dim", "额度 —");
+			seg1.push(`${t.fg("muted", "订阅")} ${quotaText}`);
+			if (goQuota?.useBalance) seg1.push(t.fg("dim", "Zen余额回落开"));
+			const sessionCost = fmtSessionCost(cnyCost, uncoveredUsd);
+			if (sessionCost !== null) seg1.push(`本次 ${t.fg("warning", sessionCost)}`);
+		} else if (auth.kind === "oauth") {
 			const quotaParts: string[] = [];
 			if (codexQuota?.primary) {
 				const q = codexQuota.primary;
@@ -609,18 +623,11 @@ export default function hud(pi: ExtensionAPI) {
 						: t.fg("dim", "额度 —");
 			seg1.push(`${t.fg("muted", "订阅")} ${quotaText}`);
 		} else {
-			if (auth.kind === "api_key") {
-				if (ctx.model?.provider === "opencode-go") {
-					// opencode 网关无余额 API，改用官方用量接口（滚动/周/月 已用百分比）
-					const parts = opencodeUsage ? opencodeUsage.windows.map((w) => `${w.label}${w.usedPercent.toFixed(0)}%`) : null;
-					seg1.push(
-						parts && parts.length > 0
-							? `${t.fg("muted", "用量")} ${parts.join(t.fg("dim", " · "))}`
-							: `${t.fg("muted", "用量")} ${opencodeUsageFailed ? t.fg("error", "✗") : t.fg("dim", "—")}`,
-					);
-				} else {
-					seg1.push(`${t.fg("muted", "API")} 余额 ${balance ? t.fg("success", fmtMoney(balance.amount, balance.currency)) : t.fg("dim", "—")}`);
-				}
+			// 只有在 BALANCE_APIS 里登记过的才显示余额栏，避免 opencode-go 之类误导成「余额 —」
+			if (auth.kind === "api_key" && ctx.model?.provider && BALANCE_APIS[ctx.model.provider]) {
+				seg1.push(
+					`${t.fg("muted", "API")} 余额 ${balance ? t.fg("success", fmtMoney(balance.amount, balance.currency)) : t.fg("dim", "—")}`,
+				);
 			}
 			const sessionCost = fmtSessionCost(cnyCost, uncoveredUsd);
 			if (sessionCost !== null) seg1.push(`本次 ${t.fg("warning", sessionCost)}`);
@@ -688,7 +695,7 @@ export default function hud(pi: ExtensionAPI) {
 		if (ctx.model) auth = readAuthInfo(authPath, ctx.model.provider);
 		maybeFetchBalance(ctx);
 		maybeFetchCodexQuota(ctx);
-		maybeFetchOpencodeUsage(ctx);
+		maybeFetchOpencodeGoQuota(ctx);
 		refresh(ctx);
 	});
 
@@ -699,12 +706,13 @@ export default function hud(pi: ExtensionAPI) {
 		codexQuota = null;
 		codexQuotaAt = 0;
 		codexQuotaFailed = false;
-		opencodeUsage = null;
-		opencodeUsageAt = 0;
-		opencodeUsageFailed = false;
+		goQuota = null;
+		goQuotaAt = 0;
+		goQuotaFailed = false;
+		goAuthExpired = false;
 		maybeFetchBalance(ctx);
 		maybeFetchCodexQuota(ctx);
-		maybeFetchOpencodeUsage(ctx);
+		maybeFetchOpencodeGoQuota(ctx);
 		refresh(ctx);
 	});
 
@@ -734,7 +742,7 @@ export default function hud(pi: ExtensionAPI) {
 		stopTimer();
 		maybeFetchBalance(ctx);
 		maybeFetchCodexQuota(ctx);
-		maybeFetchOpencodeUsage(ctx);
+		maybeFetchOpencodeGoQuota(ctx);
 		refresh(ctx);
 	});
 

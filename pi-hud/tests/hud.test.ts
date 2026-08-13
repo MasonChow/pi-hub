@@ -11,8 +11,11 @@ import { test } from "node:test";
 
 import {
 	addUsage,
+	applyGoQuotaFetchResult,
 	bar,
 	cacheHitRate,
+	classifyDashboardAuthFailure,
+	classifyGoWindowName,
 	ctxAlive,
 	emptyAgg,
 	exactCnyCost,
@@ -22,13 +25,20 @@ import {
 	fmtSessionCost,
 	fmtTokens,
 	fmtWindowLabel,
+	formatGoQuotaStatusText,
+	GO_AUTH_LOGIN_URL,
+	goAuthNotifyMessage,
+	goQuotaWindowEntries,
 	parseCodexUsage,
 	parseDeepseekBalance,
 	parseMoonshotBalance,
-	parseOpencodeUsage,
+	parseOpencodeGoDashboardHtml,
+	parseOpencodeGoUsage,
 	parseStepfunBalance,
 	readAuthInfo,
 	recordSubagentResults,
+	resolveOpencodeGoQuotaConfig,
+	shouldNotifyGoAuthExpired,
 	summarizeSubagents,
 	type SubagentRecord,
 } from "../src/index.ts";
@@ -206,41 +216,6 @@ test("fmtWindowLabel", () => {
 });
 
 // 真实抓包样本：GET https://opencode.ai/zen/go/v1/usage 带 api key 的响应
-// （rolling 为滚动窗口，weekly/monthly 为周/月配额，percent 为已用百分比）
-test("parseOpencodeUsage: 真实抓包样本（滚动/周/月 三窗口）", () => {
-	const u = parseOpencodeUsage({
-		usage: {
-			rolling: { status: "ok", percent: 0, resetsAt: "2026-08-12T07:03:44.611Z" },
-			weekly: { status: "ok", percent: 7, resetsAt: "2026-08-17T00:00:00.611Z" },
-			monthly: { status: "ok", percent: 4, resetsAt: "2026-09-07T03:01:04.611Z" },
-		},
-	});
-	assert.ok(u);
-	assert.equal(u.windows.length, 3);
-	assert.deepEqual(u.windows.map((w) => w.label), ["滚动", "周", "月"]);
-	assert.deepEqual(u.windows.map((w) => w.usedPercent), [0, 7, 4]);
-});
-
-test("parseOpencodeUsage: status 非 ok 的窗口跳过 / 脏输入", () => {
-	// rolling 被限流（status != "ok"），只保留 weekly
-	const u = parseOpencodeUsage({
-		usage: {
-			rolling: { status: "exhausted", percent: 100 },
-			weekly: { status: "ok", percent: 50, resetsAt: "2026-08-17T00:00:00.000Z" },
-		},
-	});
-	assert.ok(u);
-	assert.equal(u.windows.length, 1);
-	assert.equal(u.windows[0].label, "周");
-	assert.equal(u.windows[0].usedPercent, 50);
-	// 一个窗口都解析不出 → null
-	assert.equal(parseOpencodeUsage({ usage: {} }), null);
-	assert.equal(parseOpencodeUsage({ usage: { rolling: { status: "ok", percent: "abc" } } }), null);
-	assert.equal(parseOpencodeUsage({}), null);
-	assert.equal(parseOpencodeUsage(null), null);
-	assert.equal(parseOpencodeUsage("garbage"), null);
-});
-
 test("parseDeepseekBalance", () => {
 	const b = parseDeepseekBalance({
 		is_available: true,
@@ -355,4 +330,212 @@ test("recordSubagentResults: 脏 details 不入库", () => {
 	recordSubagentResults(store, { results: [] }, "c3");
 	recordSubagentResults(store, { results: ["garbage"] }, "c4");
 	assert.equal(store.size, 0);
+});
+
+// --- OpenCode Go -------------------------------------------------------------
+
+test("parseOpencodeGoUsage: PR #16513 对象形（rolling/weekly/monthly）", () => {
+	const q = parseOpencodeGoUsage({
+		useBalance: false,
+		rollingUsage: { status: "ok", resetInSec: 2520, usagePercent: 65 },
+		weeklyUsage: { status: "ok", resetInSec: 259200, usagePercent: 30 },
+		monthlyUsage: { status: "ok", resetInSec: 1728000, usagePercent: 12 },
+	});
+	assert.ok(q);
+	assert.equal(q.rolling?.usedPercent, 65);
+	assert.equal(q.rolling?.resetsInSeconds, 2520);
+	assert.equal(q.weekly?.usedPercent, 30);
+	assert.equal(q.monthly?.usedPercent, 12);
+	assert.equal(q.useBalance, false);
+	assert.equal(q.source, "api");
+});
+
+test("parseOpencodeGoUsage: windows[] 形 + 脏输入", () => {
+	const q = parseOpencodeGoUsage({
+		windows: [
+			{ name: "5-hour", usagePercent: 10, resetInSec: 100 },
+			{ name: "weekly", usagePercent: 20, resetInSec: 200 },
+			{ name: "monthly", usagePercent: 30, resetInSec: 300 },
+		],
+	});
+	assert.ok(q);
+	assert.equal(q.rolling?.usedPercent, 10);
+	assert.equal(q.weekly?.usedPercent, 20);
+	assert.equal(q.monthly?.usedPercent, 30);
+	assert.equal(parseOpencodeGoUsage(null), null);
+	assert.equal(parseOpencodeGoUsage({}), null);
+	assert.equal(parseOpencodeGoUsage({ rollingUsage: { usagePercent: "x" } }), null);
+});
+
+test("classifyGoWindowName: week/month 优先于 hour/5，避免误分类", () => {
+	assert.equal(classifyGoWindowName("weekly"), "weekly");
+	assert.equal(classifyGoWindowName("5-hour"), "rolling");
+	assert.equal(classifyGoWindowName("rolling"), "rolling");
+	assert.equal(classifyGoWindowName("monthly"), "monthly");
+	// 旧逻辑 name.includes("5") 会把 "week-5" 之类误判；现要求 week 先命中
+	assert.equal(classifyGoWindowName("week-5"), "weekly");
+	assert.equal(classifyGoWindowName("unknown"), null);
+});
+
+test("parseOpencodeGoDashboardHtml: SSR hydration 样本（字段顺序 status/reset/percent）", () => {
+	const html = `
+		<script>/*$*/rollingUsage:$R[35]={status:"ok",resetInSec:17577,usagePercent:8}/*$*/
+		weeklyUsage:$R[36]={status:"ok",resetInSec:56759,usagePercent:22}
+		monthlyUsage:$R[37]={status:"ok",resetInSec:2486823,usagePercent:41}</script>
+	`;
+	const q = parseOpencodeGoDashboardHtml(html);
+	assert.ok(q);
+	assert.equal(q.source, "dashboard");
+	assert.equal(q.rolling?.usedPercent, 8);
+	assert.equal(q.rolling?.resetsInSeconds, 17577);
+	assert.equal(q.weekly?.usedPercent, 22);
+	assert.equal(q.monthly?.usedPercent, 41);
+});
+
+test("parseOpencodeGoDashboardHtml: percent-first 顺序 + data-slot 回退", () => {
+	const ssr = `rollingUsage:$R[1]={usagePercent:50,resetInSec:3600}`;
+	const q1 = parseOpencodeGoDashboardHtml(ssr);
+	assert.equal(q1?.rolling?.usedPercent, 50);
+	assert.equal(q1?.rolling?.resetsInSeconds, 3600);
+
+	const slot = `
+		<div data-slot="usage-item">
+			<span data-slot="usage-label">Rolling Usage</span>
+			<span data-slot="usage-value">15%</span>
+			<span data-slot="reset-time">Resets in 2 hours 10 minutes</span>
+		</div>
+		<div data-slot="usage-item">
+			<span data-slot="usage-label">Weekly Usage</span>
+			<span data-slot="usage-value">40%</span>
+			<span data-slot="reset-time">Resets in 3 days</span>
+		</div>
+	`;
+	const q2 = parseOpencodeGoDashboardHtml(slot);
+	assert.ok(q2);
+	assert.equal(q2.rolling?.usedPercent, 15);
+	assert.equal(q2.rolling?.resetsInSeconds, 2 * 3600 + 10 * 60);
+	assert.equal(q2.weekly?.usedPercent, 40);
+	assert.equal(q2.weekly?.resetsInSeconds, 3 * 86400);
+	assert.equal(parseOpencodeGoDashboardHtml("<html>no usage</html>"), null);
+});
+
+test("parseOpencodeGoDashboardHtml: SSR 缺一窗时用 data-slot 补齐，不丢已有 SSR 窗", () => {
+	const html = `
+		rollingUsage:$R[1]={usagePercent:11,resetInSec:100}
+		<div data-slot="usage-item">
+			<span data-slot="usage-label">Weekly Usage</span>
+			<span data-slot="usage-value">22%</span>
+			<span data-slot="reset-time">Resets in 1 day</span>
+		</div>
+		<div data-slot="usage-item">
+			<span data-slot="usage-label">Monthly Usage</span>
+			<span data-slot="usage-value">33%</span>
+			<span data-slot="reset-time">Resets in 2 days</span>
+		</div>
+	`;
+	const q = parseOpencodeGoDashboardHtml(html);
+	assert.ok(q);
+	assert.equal(q.rolling?.usedPercent, 11);
+	assert.equal(q.weekly?.usedPercent, 22);
+	assert.equal(q.monthly?.usedPercent, 33);
+});
+
+test("goQuotaWindowEntries: 稳定顺序 5h/周/月", () => {
+	const entries = goQuotaWindowEntries({
+		monthly: { usedPercent: 1 },
+		rolling: { usedPercent: 2 },
+		weekly: { usedPercent: 3 },
+	});
+	assert.deepEqual(
+		entries.map((e) => e.label),
+		["5h", "周", "月"],
+	);
+	assert.equal(entries[0].window.usedPercent, 2);
+});
+
+test("applyGoQuotaFetchResult: 失败清陈旧，成功替换，auth 标记需重登", () => {
+	const stale = { rolling: { usedPercent: 90 }, source: "dashboard" as const };
+	const fail = applyGoQuotaFetchResult(stale, { quota: null, reason: "unavailable" });
+	assert.equal(fail.goQuota, null);
+	assert.equal(fail.goQuotaFailed, true);
+	assert.equal(fail.goAuthExpired, false);
+	assert.equal(formatGoQuotaStatusText(fail.goQuota, fail.goQuotaFailed, fail.goAuthExpired), "额度 ✗");
+
+	const authFail = applyGoQuotaFetchResult(stale, { quota: null, reason: "auth_expired" });
+	assert.equal(authFail.goAuthExpired, true);
+	assert.equal(formatGoQuotaStatusText(authFail.goQuota, authFail.goQuotaFailed, authFail.goAuthExpired), "额度 ✗ 需重登");
+
+	const noCred = applyGoQuotaFetchResult(null, { quota: null, reason: "no_credentials" });
+	assert.equal(noCred.goAuthExpired, true);
+
+	const fresh = { rolling: { usedPercent: 10, resetsInSeconds: 60 }, source: "api" as const };
+	const ok = applyGoQuotaFetchResult(stale, { quota: fresh, reason: "ok" });
+	assert.equal(ok.goQuotaFailed, false);
+	assert.equal(ok.goAuthExpired, false);
+	assert.equal(ok.goQuota?.rolling?.usedPercent, 10);
+	assert.match(formatGoQuotaStatusText(ok.goQuota, ok.goQuotaFailed, ok.goAuthExpired), /5h 剩 90%/);
+});
+
+test("formatGoQuotaStatusText: 未就绪显示 —", () => {
+	assert.equal(formatGoQuotaStatusText(null, false), "额度 —");
+	assert.equal(formatGoQuotaStatusText(null, false, false), "额度 —");
+});
+
+test("classifyDashboardAuthFailure: 401/登录页/密码框 → auth_expired", () => {
+	assert.equal(classifyDashboardAuthFailure(401, "https://opencode.ai/workspace/x/go", ""), "auth_expired");
+	assert.equal(classifyDashboardAuthFailure(403, "https://opencode.ai/workspace/x/go", ""), "auth_expired");
+	assert.equal(
+		classifyDashboardAuthFailure(200, "https://opencode.ai/auth/login", "<html>welcome</html>"),
+		"auth_expired",
+	);
+	assert.equal(
+		classifyDashboardAuthFailure(200, "https://opencode.ai/workspace/x/go", '<input type="password" />'),
+		"auth_expired",
+	);
+	assert.equal(
+		classifyDashboardAuthFailure(500, "https://opencode.ai/workspace/x/go", "internal error"),
+		"unavailable",
+	);
+});
+
+test("shouldNotifyGoAuthExpired: 仅在新进入失效态时提醒一次", () => {
+	assert.equal(shouldNotifyGoAuthExpired(false, true), true);
+	assert.equal(shouldNotifyGoAuthExpired(true, true), false);
+	assert.equal(shouldNotifyGoAuthExpired(true, false), false);
+	assert.equal(shouldNotifyGoAuthExpired(false, false), false);
+});
+
+test("goAuthNotifyMessage: 用 /auth 而非 404 的 /workspace；有 wrk 时附带 /go", () => {
+	const base = goAuthNotifyMessage();
+	assert.match(base, /opencode\.ai\/auth/);
+	assert.doesNotMatch(base, /opencode\.ai\/workspace[^\w/]/);
+	assert.equal(GO_AUTH_LOGIN_URL, "https://opencode.ai/auth");
+
+	const withWs = goAuthNotifyMessage("wrk_01TEST");
+	assert.match(withWs, /opencode\.ai\/auth/);
+	assert.match(withWs, /opencode\.ai\/workspace\/wrk_01TEST\/go/);
+});
+
+test("resolveOpencodeGoQuotaConfig: 文件优先，env 只补空字段", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hud-go-cfg-"));
+	fs.writeFileSync(
+		path.join(dir, "opencode-go-quota.json"),
+		JSON.stringify({ workspaceId: "wrk_from_file", authCookie: "cookie_from_file" }),
+	);
+	const cfg = resolveOpencodeGoQuotaConfig(dir, {
+		OPENCODE_GO_WORKSPACE_ID: "wrk_from_env",
+		OPENCODE_GO_AUTH_COOKIE: "cookie_from_env",
+	});
+	assert.equal(cfg.workspaceId, "wrk_from_file");
+	assert.equal(cfg.authCookie, "cookie_from_file");
+
+	const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "hud-go-cfg2-"));
+	const cfg2 = resolveOpencodeGoQuotaConfig(dir2, {
+		OPENCODE_GO_WORKSPACE_ID: "wrk_only_env",
+	});
+	assert.equal(cfg2.workspaceId, "wrk_only_env");
+	assert.equal(cfg2.authCookie, undefined);
+
+	fs.rmSync(dir, { recursive: true, force: true });
+	fs.rmSync(dir2, { recursive: true, force: true });
 });

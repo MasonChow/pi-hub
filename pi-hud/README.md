@@ -11,15 +11,9 @@ pi install npm:@masonchow/pi-hud
 重启 Pi 后 HUD 自动渲染在输入框下方，会话内用 `/hud` 开关。
 
 ```text
-λ anthropic/claude-opus-5 │ 订阅 5h 剩 78% (重置 2h14m)
+λ opencode-go/deepseek-v4-flash │ 订阅 5h 剩 100% (重置 4h52m) · 周 剩 100% · 月 剩 100%
 ⊡ ██████░░░░ 62.4% 124.8k/200k │ ⏱ 4m18s │ ⚡ 43 tok/s │ ⛁ cache 78% │ ↑312.5k ↓18.2k
 ↳ scout claude-sonnet-5 ↑42.1k ↓3.8k $0.031 ×2
-```
-
-API key 形态（opencode 网关）示例：
-
-```text
-λ opencode-go/deepseek-v4-flash │ 用量 滚动0% · 周7% · 月4% │ 本次 $0.004
 ```
 
 第 3 行只在本会话跑过 subagent 时出现。
@@ -32,13 +26,37 @@ API key 形态（opencode 网关）示例：
 ✅ 缓存命中率 `cacheRead / (input + cacheRead + cacheWrite)`
 ✅ subagent 逐个列出模型 / tokens / 成本，按 runId 去重
 ✅ 订阅额度：`openai-codex`（含剩余百分比与重置倒计时）
+✅ 订阅额度：`opencode-go`（5h / 周 / 月三窗口；官方 API 优先，否则 dashboard scrape）
 ✅ API key 余额：deepseek / kimi / stepfun（其余供应商无查询 API，只显示本次花费）
-✅ opencode 网关用量：`opencode-go`（滚动 / 周 / 月三窗口已用百分比，来自官方 `GET /v1/usage`）
 
 ❌ 自定义布局、字段开关、主题配置（只有 `/hud` 一个开关）
 ❌ 跨会话历史统计、成本报表导出
-❌ 未提供余额 / 额度查询 API 的供应商
+❌ 未提供余额 / 额度查询 API 的供应商（opencode-go 除外，见下）
 
+## OpenCode Go 额度
+
+`opencode-go` 在 auth 里是 api_key，但产品是订阅额度（5h $12 / 周 $30 / 月 $60）。
+
+查询顺序：
+
+1. **官方** `GET https://opencode.ai/zen/go/v1/usage` + Bearer API key（已上线，真实抓包验证）
+2. **Dashboard scrape** `https://opencode.ai/workspace/{id}/go`（官方 API 失败时的回退）
+
+Scrape 凭据解析（**按序填缺**：已有字段不再被后面覆盖）：
+
+| 顺序 | 来源 | 说明 |
+|------|------|------|
+| 1 | `~/.pi/agent/opencode-go-quota.json` | `{ "workspaceId", "authCookie" }` |
+| 2 | opencode-quota 配置 | `~/.config/opencode/opencode-quota/opencode-go.json` 等 |
+| 3 | 环境变量 | `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE`（仅补空字段） |
+| 4 | macOS Chrome 自动 | History 抽 `wrk_*`，Cookies 解 `auth`（异步，需本机已登录） |
+
+刷新失败会清掉陈旧额度（不会继续展示过期剩余）：
+
+- 登录态 / cookie 失效、未找到凭据 → HUD `额度 ✗ 需重登`，并 **toast** 引导打开 `https://opencode.ai/auth` 重登（同一失效周期只提醒一次）。注意裸路径 `/workspace` 是 404，额度页必须是 `/workspace/{wrk_id}/go`
+- 其它错误（网络、解析）→ `额度 ✗`，不弹登录引导
+
+首次读 Keychain 可能弹一次系统权限框。
 ## 工作方式
 
 ```mermaid

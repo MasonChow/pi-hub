@@ -1,7 +1,7 @@
 {
   "name": "@masonchow/pi-hud",
-  "version": "0.1.0",
-  "description": "Pi extension: Claude Code style HUD statusline — model, context usage, cost, cache hit rate, subagents",
+  "version": "0.1.1",
+  "description": "Pi extension: Claude Code style HUD statusline — model, context usage, cost, cache hit rate, subagents, opencode-go quota",
   "type": "module",
   "license": "MIT",
   "author": "MasonChow",
@@ -35,7 +35,7 @@
     "access": "public"
   },
   "scripts": {
-    "test": "node --test tests/*.test.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
