@@ -47,7 +47,14 @@ Pi 官方 DeepSeek catalog 里 `deepseek-v4-flash` / `deepseek-v4-pro` 的 `inpu
 - 目标模型：`deepseek-v4-flash-vision-exp`（官方 pricing 页与 vision guide，2026-08-21）
 - 继承当前模型的 provider / baseUrl / 鉴权 / context window / thinking level，只改 `id`、`input` 与计价
 - 计价按官方 pricing 用识图模型自己的档位（与 flash 同档），避免从 `pro` 切过来时把成本按 pro 高估
-- 识图模型同样在 Responses allowlist 里，所以照常走 `/responses` + native `web_search` + Pi function tools（已实测 200）
+- 识图模型同样在 Responses allowlist 里，所以照常走 `/responses` + native `web_search` + Pi function tools
+
+官方 [Responses API 文档](https://api-docs.deepseek.com/zh-cn/guides/responses_api#image-input)的 tools 兼容性表按工具列举、不按模型排除，识图模型的搜索能力与其他模型一致，所以本扩展不为识图路径特殊关闭 `web_search`（实测 `/responses` + 识图模型 + `input_image` + function tools + `web_search` 返回 200）。
+
+两条按官方文档容易读错、已实测澄清的边界：
+
+- **base64 data URL 不受 8192 字符限制**。原文是「图片的 `http(s)` URL（最多 8192 个字符）或 base64 编码的 data URL」，括号只修饰 http URL；实测 3.2M 字符（约 2.4 MB PNG）的 data URL 正常返回 200。Pi 贴图与 `read` 读图都是 base64 内嵌，所以不必为体积做额外处理，inline 图片按官方限制走 32 MiB / 张。
+- **图片只允许出现在 `user` / `developer` 消息与 `function_call_output` / `custom_tool_call_output` 输出里**，`system` / `assistant` 消息带图返回 400。Pi 的两条图片来源正好落在允许范围：用户消息里的图 → `user`，`read` 之类工具返回的图 → `function_call_output`；Pi 不会把图片放进 assistant 消息，所以自动切换在两条路径上都安全。
 
 图片可以来自你贴进 prompt 的图，也可以来自 `read` 这类工具返回的 `toolResult`。切换是逐请求判断的：图片进上下文之后的每一轮都会用识图模型，纯文本会话完全不受影响。
 
