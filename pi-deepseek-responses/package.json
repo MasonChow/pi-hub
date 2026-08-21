@@ -1,7 +1,7 @@
 {
   "name": "@masonchow/pi-deepseek-responses",
-  "version": "0.1.0",
-  "description": "Pi extension: route the official DeepSeek provider through Responses API with native server-side web search",
+  "version": "0.2.0",
+  "description": "Pi extension: route the official DeepSeek provider through Responses API with native server-side web search and automatic vision-model switching",
   "type": "module",
   "license": "MIT",
   "author": "MasonChow",
@@ -17,7 +17,8 @@
     "pi-extension",
     "deepseek",
     "responses-api",
-    "web-search"
+    "web-search",
+    "vision"
   ],
   "pi": {
     "extensions": [
