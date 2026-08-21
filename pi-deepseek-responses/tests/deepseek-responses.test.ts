@@ -8,6 +8,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import deepSeekResponsesExtension, {
   buildDeepSeekResponsesStreamOptions,
+  contextHasImages,
   hasNativeWebSearchTool,
   prepareDeepSeekResponsesPayload,
   streamDeepSeekTransport,
@@ -18,6 +19,21 @@ import deepSeekResponsesExtension, {
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const emptyContext = { messages: [] } as Context;
+
+function imageContext(): Context {
+  return {
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "这张图里是什么" },
+          { type: "image", data: "AAAA", mimeType: "image/png" },
+        ],
+        timestamp: 0,
+      },
+    ],
+  } as Context;
+}
 
 function deepseekModel(id: string): Model<"openai-completions"> {
   return {
@@ -272,4 +288,88 @@ test("source keeps Pi-loader-safe pi-ai imports (no /api/* subpaths)", () => {
     pi?: { extensions?: string[] };
   };
   assert.deepEqual(manifest.pi?.extensions, ["./src/index.ts"]);
+});
+
+test("image input auto-switches official text-only models to the vision model", () => {
+  const { adapters, calls } = mockAdapters();
+
+  const result = streamDeepSeekTransport(
+    deepseekModel("deepseek-v4-pro"),
+    imageContext(),
+    undefined,
+    adapters,
+  );
+
+  assert.equal(result, "responses-stream");
+  assert.equal(calls.responses.length, 1);
+  const switched = calls.responses[0]?.model;
+  assert.equal(switched?.id, "deepseek-v4-flash-vision-exp");
+  assert.deepEqual(switched?.input, ["text", "image"]);
+  assert.equal(switched?.provider, "deepseek");
+  assert.equal(switched?.baseUrl, "https://api.deepseek.com");
+  // 官方 pricing：识图模型与 flash 同档，不能沿用 pro 的价格
+  assert.equal(switched?.cost.input, 0.14);
+});
+
+test("image input in toolResult content also triggers the vision model", () => {
+  const context = {
+    messages: [
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "read",
+        content: [
+          { type: "text", text: "Read image file [image/png]" },
+          { type: "image", data: "AAAA", mimeType: "image/png" },
+        ],
+        isError: false,
+        timestamp: 0,
+      },
+    ],
+  } as Context;
+
+  assert.equal(contextHasImages(context), true);
+  assert.equal(contextHasImages(emptyContext), false);
+
+  const { adapters, calls } = mockAdapters();
+  streamDeepSeekTransport(deepseekModel("deepseek-v4-flash"), context, undefined, adapters);
+  assert.equal(calls.responses[0]?.model.id, "deepseek-v4-flash-vision-exp");
+});
+
+test("vision routing keeps native web_search (verified 200 on /responses)", async () => {
+  const { adapters, calls } = mockAdapters();
+  streamDeepSeekTransport(deepseekModel("deepseek-v4-flash"), imageContext(), undefined, adapters);
+
+  const options = calls.responses[0]?.options;
+  const payload = (await options?.onPayload?.(
+    { tools: [{ type: "function", name: "read" }] },
+    calls.responses[0]!.model,
+  )) as Record<string, unknown>;
+
+  assert.deepEqual(payload.tools, [
+    { type: "function", name: "read" },
+    { type: "web_search" },
+  ]);
+});
+
+test("vision auto-switch and vision model id are overridable via env", () => {
+  const { adapters, calls } = mockAdapters();
+
+  streamDeepSeekTransport(deepseekModel("deepseek-v4-flash"), imageContext(), {
+    env: { PI_DEEPSEEK_VISION_AUTO: "0" },
+  }, adapters);
+  assert.equal(calls.responses[0]?.model.id, "deepseek-v4-flash");
+
+  streamDeepSeekTransport(deepseekModel("deepseek-v4-flash"), imageContext(), {
+    env: { PI_DEEPSEEK_VISION_MODEL: "deepseek-v5-vision" },
+  }, adapters);
+  // 未进入 Responses allowlist 的自定义 id 回落到 Chat Completions
+  assert.equal(calls.completions[0]?.model.id, "deepseek-v5-vision");
+  assert.deepEqual(calls.completions[0]?.model.input, ["text", "image"]);
+});
+
+test("text-only context keeps the selected model untouched", () => {
+  const { adapters, calls } = mockAdapters();
+  streamDeepSeekTransport(deepseekModel("deepseek-v4-pro"), emptyContext, undefined, adapters);
+  assert.equal(calls.responses[0]?.model.id, "deepseek-v4-pro");
 });
