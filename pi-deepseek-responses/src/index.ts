@@ -14,20 +14,7 @@ import {
   streamSimpleOpenAIResponses as defaultStreamOpenAIResponses,
 } from "@earendil-works/pi-ai/compat";
 
-/** DeepSeek 官方识图模型（api-docs.deepseek.com pricing / vision guide，2026-08-21）。 */
-const DEEPSEEK_VISION_MODEL_ID = "deepseek-v4-flash-vision-exp";
-
-const DEEPSEEK_RESPONSES_MODELS = new Set([
-  "deepseek-v4-flash",
-  "deepseek-v4-pro",
-  DEEPSEEK_VISION_MODEL_ID,
-]);
-
-/**
- * Pi 的 DeepSeek catalog 还没有识图模型，切换后 usage 成本要有价可算。
- * 官方 pricing 页上识图模型与 flash 同档。
- */
-const DEEPSEEK_VISION_COST = { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 };
+const DEEPSEEK_RESPONSES_MODELS = new Set(["deepseek-v4-flash", "deepseek-v4-pro"]);
 
 const UNSUPPORTED_TOP_LEVEL_FIELDS = [
   "store",
@@ -62,12 +49,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function envValue(options: SimpleStreamOptions | undefined, name: string): string | undefined {
-  return options?.env?.[name] ?? process.env[name];
-}
-
 function envFlag(options: SimpleStreamOptions | undefined, name: string, fallback: boolean): boolean {
-  const value = envValue(options, name);
+  const value = options?.env?.[name] ?? process.env[name];
   if (value === undefined) return fallback;
   return !["0", "false", "off", "no"].includes(value.trim().toLowerCase());
 }
@@ -85,38 +68,6 @@ export function supportsDeepSeekResponses(
 
 export function isWebSearchEnabled(options?: SimpleStreamOptions): boolean {
   return envFlag(options, "PI_DEEPSEEK_WEB_SEARCH", true);
-}
-
-/** 图片可能来自用户消息，也可能来自 read 之类工具的 toolResult。 */
-export function contextHasImages(context: Context): boolean {
-  return context.messages.some(
-    (message) =>
-      Array.isArray(message.content) && message.content.some((part) => part.type === "image"),
-  );
-}
-
-/**
- * 官方 catalog 里 deepseek-v4-flash / pro 都是纯文本模型，Pi 会在 adapter 里把图片
- * 降级成占位文本。上下文一旦出现图片就改投官方识图模型，其余元数据（provider、
- * baseUrl、鉴权、context window、thinking level）沿用当前模型。
- */
-export function resolveVisionModel(
-  model: Model<Api>,
-  context: Context,
-  options?: SimpleStreamOptions,
-): Model<Api> | undefined {
-  if (model.provider !== "deepseek" || model.input.includes("image")) return undefined;
-  if (!envFlag(options, "PI_DEEPSEEK_VISION_AUTO", true)) return undefined;
-  if (!contextHasImages(context)) return undefined;
-
-  const id = envValue(options, "PI_DEEPSEEK_VISION_MODEL")?.trim() || DEEPSEEK_VISION_MODEL_ID;
-  return {
-    ...model,
-    id,
-    name: id,
-    input: ["text", "image"],
-    cost: id === DEEPSEEK_VISION_MODEL_ID ? DEEPSEEK_VISION_COST : model.cost,
-  };
 }
 
 export function isDebugEnabled(options?: SimpleStreamOptions): boolean {
@@ -165,6 +116,9 @@ export function toResponsesModel(model: Model<Api>): Model<"openai-responses"> {
   return {
     ...model,
     api: "openai-responses",
+    // Responses-capable 的 DeepSeek 模型服务端已原生收图，但 Pi 0.84.1 的 catalog 仍把
+    // input 标成纯 text，adapter 会在发请求前把图片降级成 (image omitted: ...) 占位文本。
+    input: ["text", "image"],
     compat: {
       supportsDeveloperRole: true,
       supportsLongCacheRetention: false,
@@ -254,17 +208,6 @@ export function streamDeepSeekTransport(
   options?: SimpleStreamOptions,
   adapters: DeepSeekStreamAdapters = defaultStreamAdapters,
 ) {
-  const visionModel = resolveVisionModel(model, context, options);
-  if (visionModel) {
-    if (isDebugEnabled(options)) {
-      console.error(
-        `[pi-deepseek-responses] image input detected: ${model.id} -> ${visionModel.id}`,
-      );
-    }
-    // 识图模型自身 input 含 image，递归只会发生一次。
-    return streamDeepSeekTransport(visionModel, context, options, adapters);
-  }
-
   if (!supportsDeepSeekResponses(model)) {
     if (isDebugEnabled(options)) {
       console.error(
