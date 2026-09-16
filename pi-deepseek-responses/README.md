@@ -1,97 +1,75 @@
 # @masonchow/pi-deepseek-responses
 
-把 **已支持 Responses API 的 Pi 官方 DeepSeek 模型**透明切到 DeepSeek Responses API，并默认启用 DeepSeek 官方 server-side `web_search`。尚未支持 Responses 的 DeepSeek 模型继续使用 Pi 原来的 Chat Completions transport。
-
-安装后继续正常选择原 provider/model：
+给 Pi 的官方 DeepSeek 模型接上 **DeepSeek 原生的 server-side 联网搜索**——模型自己发起搜索、自己读页面、自己汇总，客户端不需要任何搜索 API。
 
 ```bash
 pi install npm:@masonchow/pi-deepseek-responses
-pi --provider deepseek --model deepseek-v4-flash
+pi --provider deepseek --model deepseek-flash
 ```
 
-链路：
+问一句需要实时信息的话即可验证：
+
+```
+> 北京现在的实时温度是多少？
+北京当前实时温度约 29℃（不同数据源略有差异，多在 28–29℃ 之间）。
+```
+
+## 适用范围
+
+✅ `deepseek-flash`、`deepseek-v4-pro`，以及未来的 `deepseek-v5-flash` 等新代际（模式匹配自动覆盖）
+✅ Pi 的全部 function tools（`read` / `bash` / `edit` / 其他扩展工具）与搜索共存
+✅ 图片输入、thinking / reasoning effort
+
+❌ `deepseek-chat` / `deepseek-reasoner` / `deepseek-v4-flash-vision-exp` 等——保持 Pi 原有 Chat Completions 行为，不受影响
+❌ 非官方 DeepSeek provider（openrouter 等）
+
+## 为什么绕到 Anthropic 端点
+
+DeepSeek 有两个 API 端点，**server-side 搜索只存在于 Anthropic 兼容的那个**：
+
+| 端点 | 协议 | web_search |
+|---|---|---|
+| `api.deepseek.com/responses` | OpenAI Responses | ❌ 官方兼容表标为 **Ignored** |
+| `api.deepseek.com/v1/chat/completions` | OpenAI Completions | ❌ 只有客户端 `function` 工具 |
+| `api.deepseek.com/anthropic` | Anthropic Messages | ✅ `server_tool_use` + `web_search_tool_result` |
+
+Responses 端点会**解析** `{"type":"web_search"}`（响应里照样回显它、补全 `search_context_size` 和 `user_location`），但**不执行**——没有 `web_search_call`、没有 annotations，模型最多吐一段裸文本 `<tool_call>`。这是个静默的空操作，光看请求有没有报错查不出来。
+
+所以搜索开启时，扩展把 transport 换成 Pi 自带的 `anthropic-messages` adapter，并把 baseUrl 指到 `/anthropic`：
 
 ```mermaid
 flowchart TD
   A["Pi deepseek provider"] --> B["extension transport dispatcher"]
-  B -->|"Responses-capable model"| C["Pi openai-responses adapter"]
-  C --> D["DeepSeek compatibility sanitizer"]
-  D --> E["POST api.deepseek.com/responses<br/>+ Pi function tools<br/>+ type: web_search"]
-  B -->|"unsupported / unknown model"| F["Pi openai-completions adapter"]
+  B -->|"搜索开启 + 模型匹配"| C["Pi anthropic-messages adapter<br/>baseUrl = api.deepseek.com/anthropic"]
+  C --> D["注入 web_search_20250305"]
+  D --> E["POST /anthropic/v1/messages<br/>+ Pi function tools<br/>+ server-side 搜索"]
+  B -->|"搜索关闭 / 模型不匹配"| F["Pi openai-completions adapter"]
   F --> G["original Chat Completions behavior"]
 ```
 
-## 为什么这样实现
+外层 provider 始终是 `deepseek`，所以 Pi 自带的 model catalog、`DEEPSEEK_API_KEY` / `/login` 鉴权、cost metadata、`/model` 选择行为全部不变——扩展只换协议和 base URL。
 
-Pi 当前内置 DeepSeek 使用 `openai-completions`。这个扩展通过 `registerProvider("deepseek", { streamSimple })` 覆盖 transport dispatcher，同时继续复用 Pi 自带的：
+> 包名里的 `responses` 是历史遗留：早期版本走的是 `/responses`。改包名会断掉已安装用户的 package 路径，收益不值，故保留。
 
-- DeepSeek model catalog
-- `DEEPSEEK_API_KEY` / `/login` 鉴权
-- context window / max tokens / cost metadata
-- `/model` 选择行为
-
-对已确认支持 Responses 的模型，扩展内部调用 Pi 自带的 `openai-responses` adapter；其他模型委托回 Pi 原 `openai-completions` adapter。这样无需维护第二份 DeepSeek 模型清单，也不会因为安装扩展破坏仍依赖 Chat Completions 的模型。
-
-## 图片输入
-
-DeepSeek 官方模型已原生支持多模态，本扩展不再做识图模型切换。唯一保留的处理是：Pi 0.84.1 的 DeepSeek catalog 仍把 `deepseek-v4-flash` / `deepseek-v4-pro` 的 `input` 标成纯 `text`，adapter 会在发请求前把图片降级成 `(image omitted: ...)` 占位文本，所以扩展在 Responses 路径上补声明 `input: ["text", "image"]`，让贴图与 `read` 读到的图原样发到 `/responses`。
-
-Pi 官方 catalog 更新 `input` 之后这行补丁可以删掉。
-
-## Web Search
-
-Responses-capable DeepSeek 模型默认自动追加：
-
-```json
-{ "type": "web_search" }
-```
-
-Pi 原有 function tools 会原样保留，例如 `read`、`bash`、`edit` 和其他 extension tools。
-
-关闭自动搜索注入：
-
-```bash
-export PI_DEEPSEEK_WEB_SEARCH=0
-```
-
-此时 Responses-capable DeepSeek 模型仍走 `/responses`，只关闭本扩展追加的 `web_search`。未支持 Responses 的模型仍走原 Chat Completions transport。
-
-## DeepSeek Responses 兼容层
-
-Pi 的 OpenAI Responses adapter 会生成一些 DeepSeek 当前不支持的 OpenAI-specific 字段。扩展在发送前移除这些字段，例如：
-
-- `store`
-- `include`
-- `prompt_cache_key`
-- `prompt_cache_retention`
-- `prompt_cache_options`
-- `service_tier`
-- `previous_response_id`
-- `conversation`
-
-`reasoning` 只保留 DeepSeek 当前有效的 `effort`。
-
-DeepSeek 自己管理上下文缓存，因此扩展会把 Pi 的 Responses cache retention 设为 `none`，避免生成 OpenAI prompt-cache 参数。
-
-## 当前模型支持
-
-DeepSeek 按「代际 + 档位」开放 Responses 能力，并提供指向最新代际的无版本别名。扩展用模式匹配判定：
+## 模型判定
 
 ```
 /^deepseek-(?:v\d+-)?(?:flash|pro)$/
 ```
 
-| model id | 走哪条 transport |
-|---|---|
-| `deepseek-v4-flash` / `deepseek-v4-pro` | `/responses` + native `web_search` |
-| `deepseek-flash` / `deepseek-pro`（无版本别名） | `/responses` + native `web_search` |
-| 未来代际 `deepseek-v5-flash` 等 | `/responses` + native `web_search`（不用改代码） |
-| `deepseek-chat` / `deepseek-reasoner` 等旧模型 | Pi 原 Chat Completions transport |
-| 其他未知 DeepSeek 模型 | Pi 原 Chat Completions transport |
+用模式匹配而不是硬编码 allowlist：Pi 的模型列表来自 pi.dev 远程 catalog overlay（每 4 小时刷新并与内置 catalog 合并），新模型随时会出现，写死的清单永远追不上。
 
-之前这里是一份硬编码 model id allowlist，每出一个别名就得改代码发版。改成模式匹配后新别名自动覆盖；代价是若 DeepSeek 发布了匹配该模式但服务端尚未开放 `/responses` 的模型，会走到 Responses 路径失败——真出现时把该 id 加进模式的排除项即可。
+代价是模式可能跑在服务端前面——若 DeepSeek 发布了匹配该模式但尚未开放搜索的模型，会走到 Anthropic 端点失败。真出现时加排除项即可。
 
-> 无版本别名（如 `deepseek-flash`）目前不在 Pi 0.84.1 的内置 catalog 里，`/model` 选不到。要用得先在 `~/.pi/models.json` 的 `deepseek` provider 下补一条同 id 的模型定义（models.json 层与内置 catalog 是**合并**语义，不会顶掉 `deepseek-v4-flash` / `deepseek-v4-pro`）。
+## 关闭搜索
+
+```bash
+export PI_DEEPSEEK_WEB_SEARCH=0
+```
+
+此时**连 Anthropic 端点也不走**，直接回落 Pi 原生的 Chat Completions——绕路的唯一目的就是搜索，没有搜索就没有绕路的理由。
+
+值得关的场景：server-side 搜索每次会把检索到的网页内容塞进上下文，实测一次两轮搜索的请求 input_tokens 约 18k，纯代码任务开着它是白烧钱。
 
 ## 调试
 
@@ -99,28 +77,27 @@ DeepSeek 按「代际 + 档位」开放 Responses 能力，并提供指向最新
 export PI_DEEPSEEK_RESPONSES_DEBUG=1
 ```
 
-Responses 路径：
+搜索路径：
 
 ```text
-[pi-deepseek-responses] provider=deepseek model=deepseek-v4-flash api=openai-responses web_search=enabled
-[pi-deepseek-responses] request tools=function,function,web_search
+[pi-deepseek-responses] provider=deepseek model=deepseek-flash api=anthropic-messages web_search=enabled
+[pi-deepseek-responses] request tools=function,function,...,web_search_20250305
 ```
 
-Fallback 路径（未知 / 尚未开放 Responses 的模型）：
+回落路径：
 
 ```text
-[pi-deepseek-responses] provider=deepseek model=future-model api=openai-completions responses=unsupported
+[pi-deepseek-responses] provider=deepseek model=deepseek-flash api=openai-completions web_search=disabled
+[pi-deepseek-responses] provider=deepseek model=future-model api=openai-completions model=unsupported
 ```
 
 不会打印 API key 或完整 prompt。
 
 ## 已知限制
 
-Pi 当前 `openai-responses` parser 会忽略 provider-specific `web_search_call` transcript item。单轮搜索与最终文本输出可以正常工作；需要原样 replay `web_search_call` 来恢复完整搜索上下文的多轮场景，仍需要后续扩展 parser/session 持久化能力。
+DeepSeek 的 Anthropic 兼容层会静默忽略部分请求字段（`top_k`、`service_tier`、`container`、`mcp_servers`），`thinking.budget_tokens` 也被忽略——都不报错，所以扩展不做字段清洗。`metadata` 只认 `user_id`。
 
-这个限制也是 Pi maintainer 暂不把 server-side tools 做成 core 通用抽象的主要原因之一。
-
-Pi 的 `read` 工具按 catalog 里的 `input` 判断模型是否收图，catalog 仍标 text-only 时会在 `toolResult` 文本里附一句 `[Current model does not support images. The image will be omitted from this request.]`。本扩展在 transport 层补了 `input`、图片实际发得出去，所以这句提示是对 LLM 的误导性噪音。要消掉它得等 Pi 官方 catalog 更新。
+搜索结果里的 `encrypted_content` 只有模型在 session 内能解密，客户端侧只看得到 title 和 url，这是 Anthropic 的设计，DeepSeek 照搬了。
 
 ## 本地开发
 
@@ -129,40 +106,22 @@ cd pi-deepseek-responses
 npm install
 npm test
 npm run typecheck
-
-# 建议用本包 peer 对应的 Pi 版本（当前 0.84.1）
-./node_modules/.bin/pi -e ./src/index.ts --provider deepseek --model deepseek-v4-flash
 ```
 
-实现依赖 Pi extension loader 暴露的 `@earendil-works/pi-ai/compat` stream helpers（`streamSimpleOpenAIResponses` / `streamSimpleOpenAICompletions`）。**不要**从 `@earendil-works/pi-ai/api/*` 子路径导入——jiti 会把该路径错误拼到 `compat.js` 上导致扩展加载失败。
+实现依赖 Pi extension loader 暴露的 `@earendil-works/pi-ai/compat` stream helpers（`streamSimpleAnthropic` / `streamSimpleOpenAICompletions`）。**不要**从 `@earendil-works/pi-ai/api/*` 子路径导入——jiti 会把该路径错误拼到 `compat.js` 上导致扩展加载失败（有单测守着这条）。
 
-真实 API smoke（已在 Pi 0.84.1 + DeepSeek 账号验证）：
+真实 API smoke（已在 Pi 0.85.1 + DeepSeek 账号验证）：
 
 ```bash
-PI_DEEPSEEK_RESPONSES_DEBUG=1 \
-  ./node_modules/.bin/pi -e ./src/index.ts --provider deepseek --model deepseek-v4-flash \
-  -p --no-session --no-tools \
-  "搜索今天 Pi coding agent 的最新版本变化，并给出来源"
+# 搜索路径：应返回真实实时数据
+PI_DEEPSEEK_RESPONSES_DEBUG=1 pi --provider deepseek --model deepseek-flash \
+  -p --no-session --no-tools "北京现在的实时温度是多少？一句话回答"
 
-PI_DEEPSEEK_RESPONSES_DEBUG=1 \
-  ./node_modules/.bin/pi -e ./src/index.ts --provider deepseek --model deepseek-v4-pro \
-  -p --no-session --no-tools \
-  "搜索今天 Pi coding agent 的最新版本变化，并给出来源"
+# 回落路径：应打印 api=openai-completions
+PI_DEEPSEEK_WEB_SEARCH=0 PI_DEEPSEEK_RESPONSES_DEBUG=1 pi --provider deepseek \
+  --model deepseek-flash -p --no-session --no-tools "只回复两个字：收到"
 
-# 图片输入（需要 tools，让模型用 read 读图）
-PI_DEEPSEEK_RESPONSES_DEBUG=1 \
-  ./node_modules/.bin/pi -e ./src/index.ts --provider deepseek --model deepseek-v4-flash \
-  -p --no-session \
-  "只做一件事：用 read 工具读取 /tmp/some.png，然后回答图片内容。禁止使用 bash。"
+# function tools 与搜索共存：应看到 tools=function,...,web_search_20250305
+PI_DEEPSEEK_RESPONSES_DEBUG=1 pi --provider deepseek --model deepseek-flash \
+  -p --no-session "用 read 工具读取 /tmp/note.txt 并复述内容。禁止用 bash。"
 ```
-
-期望 debug 行：
-
-```text
-# flash
-api=openai-responses web_search=enabled
-# pro
-api=openai-responses web_search=enabled
-```
-
-Responses + `web_search` 路径已在 Pi 0.84.1 + DeepSeek 账号实测。去掉识图切换后的图片输入路径尚未实跑验证，只跑过单测与 typecheck。
