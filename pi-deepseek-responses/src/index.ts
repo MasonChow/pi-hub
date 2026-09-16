@@ -14,7 +14,13 @@ import {
   streamSimpleOpenAIResponses as defaultStreamOpenAIResponses,
 } from "@earendil-works/pi-ai/compat";
 
-const DEEPSEEK_RESPONSES_MODELS = new Set(["deepseek-v4-flash", "deepseek-v4-pro"]);
+/**
+ * DeepSeek 按「代际 + 档位」开放 Responses 能力：`deepseek-v4-flash` /
+ * `deepseek-v4-pro`，外加指向最新代际的无版本别名 `deepseek-flash` /
+ * `deepseek-pro`。用模式匹配代替硬编码清单，新别名与新代际不用改代码。
+ * `deepseek-chat` / `deepseek-reasoner` 等旧 completions-only 模型不匹配。
+ */
+const DEEPSEEK_RESPONSES_MODEL_PATTERN = /^deepseek-(?:v\d+-)?(?:flash|pro)$/;
 
 const UNSUPPORTED_TOP_LEVEL_FIELDS = [
   "store",
@@ -63,7 +69,7 @@ function envFlag(options: SimpleStreamOptions | undefined, name: string, fallbac
 export function supportsDeepSeekResponses(
   model: Pick<Model<Api>, "provider" | "id">,
 ): boolean {
-  return model.provider === "deepseek" && DEEPSEEK_RESPONSES_MODELS.has(model.id);
+  return model.provider === "deepseek" && DEEPSEEK_RESPONSES_MODEL_PATTERN.test(model.id);
 }
 
 export function isWebSearchEnabled(options?: SimpleStreamOptions): boolean {
