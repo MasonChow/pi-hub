@@ -105,21 +105,33 @@ test("non-object payload passes through", () => {
   assert.equal(prepareDeepSeekResponsesPayload("hello"), "hello");
 });
 
-test("Responses capability is explicitly gated by official provider and supported model", () => {
-  assert.equal(
-    supportsDeepSeekResponses({ provider: "deepseek", id: "deepseek-v4-flash" }),
-    true,
-  );
-  assert.equal(
-    supportsDeepSeekResponses({ provider: "deepseek", id: "deepseek-v4-pro" }),
-    true,
-  );
+test("Responses capability is gated by official provider and flash/pro model pattern", () => {
+  for (const id of [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    // 无版本别名：deepseek-flash 指向最新代际 flash
+    "deepseek-flash",
+    "deepseek-pro",
+    // 未来代际自动覆盖，不用改代码
+    "deepseek-v5-flash",
+  ]) {
+    assert.equal(supportsDeepSeekResponses({ provider: "deepseek", id }), true, id);
+  }
+
+  for (const id of [
+    // completions-only 旧模型
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "future-model",
+    // 不能被前缀/子串误匹配
+    "deepseek-v4-flash-preview",
+    "my-deepseek-flash",
+  ]) {
+    assert.equal(supportsDeepSeekResponses({ provider: "deepseek", id }), false, id);
+  }
+
   assert.equal(
     supportsDeepSeekResponses({ provider: "openrouter", id: "deepseek-v4-flash" }),
-    false,
-  );
-  assert.equal(
-    supportsDeepSeekResponses({ provider: "deepseek", id: "future-model" }),
     false,
   );
 });

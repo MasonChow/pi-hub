@@ -75,13 +75,23 @@ DeepSeek 自己管理上下文缓存，因此扩展会把 Pi 的 Responses cache
 
 ## 当前模型支持
 
-截至 2026-08-13，DeepSeek 官方 Responses 文档明确写明：
+DeepSeek 按「代际 + 档位」开放 Responses 能力，并提供指向最新代际的无版本别名。扩展用模式匹配判定：
 
-- `deepseek-v4-flash`：支持 Responses API → 本扩展路由到 `/responses` + native `web_search`
-- `deepseek-v4-pro`：支持 Responses API（2026-08-13 起开放）→ 本扩展路由到 `/responses` + native `web_search`
-- 其他未知 DeepSeek 模型：默认保留 Pi 原 Chat Completions transport
+```
+/^deepseek-(?:v\d+-)?(?:flash|pro)$/
+```
 
-Responses 能力采用显式 allowlist，避免新/旧 catalog 模型因服务端尚未开放 `/responses` 而回归失败。DeepSeek 官方新增 Responses 模型后，需要把对应 model id 加入 `DEEPSEEK_RESPONSES_MODELS` 并发布新版扩展。
+| model id | 走哪条 transport |
+|---|---|
+| `deepseek-v4-flash` / `deepseek-v4-pro` | `/responses` + native `web_search` |
+| `deepseek-flash` / `deepseek-pro`（无版本别名） | `/responses` + native `web_search` |
+| 未来代际 `deepseek-v5-flash` 等 | `/responses` + native `web_search`（不用改代码） |
+| `deepseek-chat` / `deepseek-reasoner` 等旧模型 | Pi 原 Chat Completions transport |
+| 其他未知 DeepSeek 模型 | Pi 原 Chat Completions transport |
+
+之前这里是一份硬编码 model id allowlist，每出一个别名就得改代码发版。改成模式匹配后新别名自动覆盖；代价是若 DeepSeek 发布了匹配该模式但服务端尚未开放 `/responses` 的模型，会走到 Responses 路径失败——真出现时把该 id 加进模式的排除项即可。
+
+> 无版本别名（如 `deepseek-flash`）目前不在 Pi 0.84.1 的内置 catalog 里，`/model` 选不到。要用得先在 `~/.pi/models.json` 的 `deepseek` provider 下补一条同 id 的模型定义（models.json 层与内置 catalog 是**合并**语义，不会顶掉 `deepseek-v4-flash` / `deepseek-v4-pro`）。
 
 ## 调试
 
