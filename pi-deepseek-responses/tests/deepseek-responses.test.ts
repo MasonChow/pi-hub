@@ -7,17 +7,18 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import deepSeekResponsesExtension, {
-  buildDeepSeekResponsesStreamOptions,
+  buildDeepSeekAnthropicStreamOptions,
   hasNativeWebSearchTool,
-  prepareDeepSeekResponsesPayload,
+  prepareDeepSeekAnthropicPayload,
   streamDeepSeekTransport,
-  supportsDeepSeekResponses,
-  toResponsesModel,
+  supportsDeepSeekWebSearch,
+  toAnthropicModel,
   type DeepSeekStreamAdapters,
 } from "../src/index.ts";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const emptyContext = { messages: [] } as Context;
+const WEB_SEARCH = { type: "web_search_20250305", name: "web_search" };
 
 function deepseekModel(id: string): Model<"openai-completions"> {
   return {
@@ -36,14 +37,14 @@ function deepseekModel(id: string): Model<"openai-completions"> {
 
 function mockAdapters() {
   const calls: {
-    responses: Array<{ model: Model<"openai-responses">; options?: SimpleStreamOptions }>;
+    anthropic: Array<{ model: Model<"anthropic-messages">; options?: SimpleStreamOptions }>;
     completions: Array<{ model: Model<"openai-completions">; options?: SimpleStreamOptions }>;
-  } = { responses: [], completions: [] };
+  } = { anthropic: [], completions: [] };
 
   const adapters = {
-    streamOpenAIResponses(model, _context, options) {
-      calls.responses.push({ model, options });
-      return "responses-stream" as never;
+    streamAnthropic(model, _context, options) {
+      calls.anthropic.push({ model, options });
+      return "anthropic-stream" as never;
     },
     streamOpenAICompletions(model, _context, options) {
       calls.completions.push({ model, options });
@@ -54,68 +55,53 @@ function mockAdapters() {
   return { adapters, calls };
 }
 
-test("prepareDeepSeekResponsesPayload removes unsupported OpenAI fields", () => {
-  const payload = prepareDeepSeekResponsesPayload({
-    model: "deepseek-v4-flash",
-    store: false,
-    include: ["reasoning.encrypted_content"],
-    prompt_cache_key: "session",
-    prompt_cache_retention: "24h",
-    service_tier: "priority",
-    tools: [{ type: "function", name: "bash" }],
-    reasoning: { effort: "high", summary: "auto" },
+test("web_search tool is appended without touching function tools", () => {
+  const payload = prepareDeepSeekAnthropicPayload({
+    model: "deepseek-flash",
+    tools: [{ name: "bash", input_schema: {} }],
   }) as Record<string, unknown>;
 
-  assert.equal(payload.store, undefined);
-  assert.equal(payload.include, undefined);
-  assert.equal(payload.prompt_cache_key, undefined);
-  assert.equal(payload.prompt_cache_retention, undefined);
-  assert.equal(payload.service_tier, undefined);
-  assert.deepEqual(payload.reasoning, { effort: "high" });
-  assert.deepEqual(payload.tools, [
-    { type: "function", name: "bash" },
-    { type: "web_search" },
-  ]);
+  assert.deepEqual(payload.tools, [{ name: "bash", input_schema: {} }, WEB_SEARCH]);
+  assert.equal(payload.model, "deepseek-flash");
 });
 
 test("web_search injection is idempotent", () => {
-  const payload = prepareDeepSeekResponsesPayload({
-    tools: [{ type: "web_search" }, { type: "function", name: "read" }],
-  }) as Record<string, unknown>;
+  const once = prepareDeepSeekAnthropicPayload({ tools: [] });
+  const twice = prepareDeepSeekAnthropicPayload(once) as Record<string, unknown>;
 
-  const tools = payload.tools as unknown[];
-  assert.equal(tools.length, 2);
-  assert.ok(hasNativeWebSearchTool(tools));
+  assert.deepEqual(twice.tools, [WEB_SEARCH]);
 });
 
-test("versioned DeepSeek web search tool counts as native search", () => {
-  assert.equal(hasNativeWebSearchTool([{ type: "web_search_2025_08_26" }]), true);
+test("any web_search_* tool variant counts as native search", () => {
+  assert.equal(hasNativeWebSearchTool([{ type: "web_search_20250305" }]), true);
+  assert.equal(hasNativeWebSearchTool([{ type: "web_search" }]), true);
+  assert.equal(hasNativeWebSearchTool([{ type: "web_search_20991231" }]), true);
+  assert.equal(hasNativeWebSearchTool([{ name: "bash" }]), false);
+  assert.equal(hasNativeWebSearchTool([]), false);
 });
 
-test("web search can be disabled without changing function tools", () => {
-  const payload = prepareDeepSeekResponsesPayload(
-    { tools: [{ type: "function", name: "read" }] },
-    false,
-  ) as Record<string, unknown>;
-
-  assert.deepEqual(payload.tools, [{ type: "function", name: "read" }]);
+test("payload with no tools key still gets web_search", () => {
+  const payload = prepareDeepSeekAnthropicPayload({ model: "deepseek-flash" }) as Record<
+    string,
+    unknown
+  >;
+  assert.deepEqual(payload.tools, [WEB_SEARCH]);
 });
 
 test("non-object payload passes through", () => {
-  assert.equal(prepareDeepSeekResponsesPayload("hello"), "hello");
+  assert.equal(prepareDeepSeekAnthropicPayload("hello"), "hello");
 });
 
-test("Responses capability is gated by official provider and flash/pro model pattern", () => {
+test("search capability is gated by official provider and flash/pro model pattern", () => {
   for (const id of [
-    "deepseek-v4-flash",
-    "deepseek-v4-pro",
-    // 无版本别名：deepseek-flash 指向最新代际 flash
+    // 服务端 /models 当前返回的两个
     "deepseek-flash",
-    "deepseek-pro",
+    "deepseek-v4-pro",
     // 未来代际自动覆盖，不用改代码
     "deepseek-v5-flash",
+    "deepseek-pro",
   ]) {
-    assert.equal(supportsDeepSeekResponses({ provider: "deepseek", id }), true, id);
+    assert.equal(supportsDeepSeekWebSearch({ provider: "deepseek", id }), true, id);
   }
 
   for (const id of [
@@ -124,27 +110,29 @@ test("Responses capability is gated by official provider and flash/pro model pat
     "deepseek-reasoner",
     "future-model",
     // 不能被前缀/子串误匹配
-    "deepseek-v4-flash-preview",
+    "deepseek-v4-flash-vision-exp",
     "my-deepseek-flash",
   ]) {
-    assert.equal(supportsDeepSeekResponses({ provider: "deepseek", id }), false, id);
+    assert.equal(supportsDeepSeekWebSearch({ provider: "deepseek", id }), false, id);
   }
 
   assert.equal(
-    supportsDeepSeekResponses({ provider: "openrouter", id: "deepseek-v4-flash" }),
+    supportsDeepSeekWebSearch({ provider: "openrouter", id: "deepseek-flash" }),
     false,
   );
 });
 
-test("toResponsesModel keeps provider/catalog metadata and changes only transport semantics", () => {
-  const model = deepseekModel("deepseek-v4-flash");
-  const result = toResponsesModel(model);
-  assert.equal(result.api, "openai-responses");
+test("toAnthropicModel swaps protocol and base URL but keeps catalog metadata", () => {
+  const model = deepseekModel("deepseek-flash");
+  const result = toAnthropicModel(model);
+
+  assert.equal(result.api, "anthropic-messages");
+  // server-side web search 只存在于 Anthropic 兼容端点
+  assert.equal(result.baseUrl, "https://api.deepseek.com/anthropic");
   assert.equal(result.provider, "deepseek");
   assert.equal(result.id, model.id);
-  assert.equal(result.baseUrl, model.baseUrl);
   assert.equal(result.contextWindow, model.contextWindow);
-  // Pi 0.84.1 catalog 仍标 text-only，必须补声明才不会被 adapter 摘掉图片
+  assert.deepEqual(result.cost, model.cost);
   assert.deepEqual(result.input, ["text", "image"]);
 });
 
@@ -166,107 +154,99 @@ test("extension overrides only the existing deepseek transport dispatcher", () =
   assert.equal("baseUrl" in registration.config, false);
 });
 
-test("streamDeepSeekTransport routes Responses-capable models to Responses and unknown models to Completions", () => {
+test("transport detours search-capable models to Anthropic, everything else to Completions", () => {
   const { adapters, calls } = mockAdapters();
 
-  const flashResult = streamDeepSeekTransport(
-    deepseekModel("deepseek-v4-flash"),
+  const flash = streamDeepSeekTransport(
+    deepseekModel("deepseek-flash"),
     emptyContext,
     undefined,
     adapters,
   );
-  const proResult = streamDeepSeekTransport(
+  const pro = streamDeepSeekTransport(
     deepseekModel("deepseek-v4-pro"),
     emptyContext,
     undefined,
     adapters,
   );
-  const unknownResult = streamDeepSeekTransport(
+  const unknown = streamDeepSeekTransport(
     deepseekModel("future-model"),
     emptyContext,
     undefined,
     adapters,
   );
 
-  assert.equal(flashResult, "responses-stream");
-  assert.equal(proResult, "responses-stream");
-  assert.equal(unknownResult, "completions-stream");
-  assert.equal(calls.responses.length, 2);
+  assert.equal(flash, "anthropic-stream");
+  assert.equal(pro, "anthropic-stream");
+  assert.equal(unknown, "completions-stream");
+  assert.equal(calls.anthropic.length, 2);
   assert.equal(calls.completions.length, 1);
-  assert.equal(calls.responses[0]?.model.api, "openai-responses");
-  assert.equal(calls.responses[0]?.model.id, "deepseek-v4-flash");
-  assert.equal(calls.responses[1]?.model.api, "openai-responses");
-  assert.equal(calls.responses[1]?.model.id, "deepseek-v4-pro");
+  assert.equal(calls.anthropic[0]?.model.api, "anthropic-messages");
+  assert.equal(calls.anthropic[0]?.model.id, "deepseek-flash");
+  assert.equal(calls.anthropic[1]?.model.id, "deepseek-v4-pro");
   assert.equal(calls.completions[0]?.model.id, "future-model");
+  // fallback 必须保留原始 catalog 的 baseUrl，不能被改成 /anthropic
+  assert.equal(calls.completions[0]?.model.baseUrl, "https://api.deepseek.com");
 });
 
-test("Responses path forces cacheRetention none and re-sanitizes after upstream onPayload", async () => {
+test("PI_DEEPSEEK_WEB_SEARCH=0 keeps search-capable models on Pi's original completions", () => {
   const { adapters, calls } = mockAdapters();
-  const requestModel = toResponsesModel(deepseekModel("deepseek-v4-flash"));
+
+  const result = streamDeepSeekTransport(
+    deepseekModel("deepseek-flash"),
+    emptyContext,
+    { env: { PI_DEEPSEEK_WEB_SEARCH: "0" } } as SimpleStreamOptions,
+    adapters,
+  );
+
+  assert.equal(result, "completions-stream");
+  assert.equal(calls.anthropic.length, 0);
+  assert.equal(calls.completions[0]?.model.api, "openai-completions");
+});
+
+test("Anthropic path forces cacheRetention none and re-appends web_search after upstream onPayload", async () => {
+  const { adapters, calls } = mockAdapters();
+  const requestModel = toAnthropicModel(deepseekModel("deepseek-flash"));
 
   streamDeepSeekTransport(
-    deepseekModel("deepseek-v4-flash"),
+    deepseekModel("deepseek-flash"),
     emptyContext,
     {
       cacheRetention: "long",
-      onPayload: async (payload) => {
-        const dirty = {
-          ...(payload as Record<string, unknown>),
-          store: true,
-          prompt_cache_key: "hook-injected",
-          tools: [{ type: "function", name: "bash" }],
-        };
-        return dirty;
-      },
+      onPayload: async (payload) => ({
+        ...(payload as Record<string, unknown>),
+        // upstream hook 把工具列表整个换掉，web_search 必须被补回来
+        tools: [{ name: "bash", input_schema: {} }],
+      }),
     },
     adapters,
   );
 
-  assert.equal(calls.responses.length, 1);
-  const options = calls.responses[0]?.options;
+  assert.equal(calls.anthropic.length, 1);
+  const options = calls.anthropic[0]?.options;
   assert.ok(options);
   assert.equal(options.cacheRetention, "none");
-  assert.equal(typeof options.onPayload, "function");
 
   const finalPayload = (await options.onPayload?.(
-    {
-      store: false,
-      include: ["reasoning.encrypted_content"],
-      tools: [{ type: "function", name: "read" }],
-      reasoning: { effort: "high", summary: "auto" },
-    },
+    { tools: [{ name: "read", input_schema: {} }] },
     requestModel,
   )) as Record<string, unknown>;
 
-  assert.equal(finalPayload.store, undefined);
-  assert.equal(finalPayload.include, undefined);
-  assert.equal(finalPayload.prompt_cache_key, undefined);
-  assert.deepEqual(finalPayload.reasoning, { effort: "high" });
-  assert.deepEqual(finalPayload.tools, [
-    { type: "function", name: "bash" },
-    { type: "web_search" },
-  ]);
+  assert.deepEqual(finalPayload.tools, [{ name: "bash", input_schema: {} }, WEB_SEARCH]);
 });
 
-test("buildDeepSeekResponsesStreamOptions re-applies web_search after upstream removes it", async () => {
-  const options = buildDeepSeekResponsesStreamOptions({
-    onPayload: async () => ({
-      tools: [{ type: "function", name: "read" }],
-      store: true,
-    }),
+test("buildDeepSeekAnthropicStreamOptions re-applies web_search after upstream removes it", async () => {
+  const options = buildDeepSeekAnthropicStreamOptions({
+    onPayload: async () => ({ tools: [{ name: "read", input_schema: {} }] }),
   });
 
   assert.equal(options.cacheRetention, "none");
   const finalPayload = (await options.onPayload?.(
-    { tools: [{ type: "web_search" }] },
-    toResponsesModel(deepseekModel("deepseek-v4-flash")),
+    { tools: [WEB_SEARCH] },
+    toAnthropicModel(deepseekModel("deepseek-flash")),
   )) as Record<string, unknown>;
 
-  assert.equal(finalPayload.store, undefined);
-  assert.deepEqual(finalPayload.tools, [
-    { type: "function", name: "read" },
-    { type: "web_search" },
-  ]);
+  assert.deepEqual(finalPayload.tools, [{ name: "read", input_schema: {} }, WEB_SEARCH]);
 });
 
 test("source keeps Pi-loader-safe pi-ai imports (no /api/* subpaths)", () => {
@@ -287,4 +267,3 @@ test("source keeps Pi-loader-safe pi-ai imports (no /api/* subpaths)", () => {
   };
   assert.deepEqual(manifest.pi?.extensions, ["./src/index.ts"]);
 });
-
