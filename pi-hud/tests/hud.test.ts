@@ -29,6 +29,7 @@ import {
 	GO_AUTH_LOGIN_URL,
 	goAuthNotifyMessage,
 	goQuotaWindowEntries,
+	isPeakHour,
 	parseCodexUsage,
 	parseDeepseekBalance,
 	parseMoonshotBalance,
@@ -108,13 +109,40 @@ test("fmtSessionCost: 精确 CNY 与未覆盖 USD 分开原样显示，不做汇
 	assert.equal(fmtSessionCost(0, 0), null);
 });
 
-test("exactCnyCost: deepseek 官方价目表按 token 精确算价，未知 provider/model 返回 null", () => {
-	// deepseek-v4-flash：input(未命中) ¥1/M、cacheRead(命中) ¥0.02/M、output ¥2/M
-	const cost = exactCnyCost("deepseek", "deepseek-v4-flash", { input: 1_000_000, output: 500_000, cacheRead: 2_000_000, cacheWrite: 0 });
-	assert.ok(cost !== null);
-	assert.ok(Math.abs((cost as number) - (1 + 1 + 0.04)) < 1e-9);
+test("exactCnyCost: deepseek 现行价目表按 token 精确算价（峰谷按消息时间选档），未知 provider/model 返回 null", () => {
+	const usage = { input: 1_000_000, output: 500_000, cacheRead: 2_000_000, cacheWrite: 0 };
+	// deepseek-flash（V4.1-Flash）高峰：input(未命中) ¥2/M、output ¥8/M、cacheRead(命中) ¥0.04/M
+	const peak = exactCnyCost("deepseek", "deepseek-flash", usage, "2026-10-02T02:00:00Z"); // 北京时间周五 10:00
+	assert.ok(peak !== null);
+	assert.ok(Math.abs((peak as number) - (2 + 4 + 0.08)) < 1e-9);
+	// 同一份用量落在空闲时段按半价：¥1 / ¥4 / ¥0.02
+	const offPeak = exactCnyCost("deepseek", "deepseek-flash", usage, "2026-10-02T12:00:00Z"); // 北京时间周五 20:00
+	assert.ok(offPeak !== null);
+	assert.ok(Math.abs((offPeak as number) - (1 + 2 + 0.04)) < 1e-9);
+	// 不传时间默认按高峰（与 pi 自带 USD cost 口径一致，不低估）
+	assert.equal(exactCnyCost("deepseek", "deepseek-flash", usage), peak);
+	// 旧名 deepseek-v4-flash 保留改名前的 flat 价：¥1 / ¥2 / ¥0.02，历史会话数字不变形
+	const legacy = exactCnyCost("deepseek", "deepseek-v4-flash", usage);
+	assert.ok(legacy !== null);
+	assert.ok(Math.abs((legacy as number) - (1 + 1 + 0.04)) < 1e-9);
 	assert.equal(exactCnyCost("deepseek", "unknown-model", { input: 1000 }), null);
 	assert.equal(exactCnyCost("openai", "gpt-5", { input: 1000 }), null);
+});
+
+test("isPeakHour: 北京时间工作日 9:00-12:00 / 14:00-18:00 为高峰，边界与周末按空闲", () => {
+	assert.equal(isPeakHour("2026-10-02T01:00:00Z"), true); // 周五 09:00 起
+	assert.equal(isPeakHour("2026-10-02T03:59:00Z"), true); // 周五 11:59
+	assert.equal(isPeakHour("2026-10-02T04:00:00Z"), false); // 周五 12:00 整转空闲
+	assert.equal(isPeakHour("2026-10-02T05:59:00Z"), false); // 周五 13:59
+	assert.equal(isPeakHour("2026-10-02T06:00:00Z"), true); // 周五 14:00 起
+	assert.equal(isPeakHour("2026-10-02T09:59:00Z"), true); // 周五 17:59
+	assert.equal(isPeakHour("2026-10-02T10:00:00Z"), false); // 周五 18:00 整转空闲
+	assert.equal(isPeakHour("2026-10-03T02:00:00Z"), false); // 周六 10:00
+	assert.equal(isPeakHour("2026-10-04T02:00:00Z"), false); // 周日 10:00
+	// number / Date 入参，以及不可解析时间（按高峰，不低估）
+	assert.equal(isPeakHour(Date.parse("2026-10-02T02:00:00Z")), true);
+	assert.equal(isPeakHour(new Date("2026-10-02T02:00:00Z")), true);
+	assert.equal(isPeakHour("not-a-time"), true);
 });
 
 test("exactCnyCost: kimi-k3 / stepfun 官方价目表", () => {
