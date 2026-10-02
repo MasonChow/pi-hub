@@ -157,38 +157,80 @@ interface CnyRate {
 	cacheWrite: number;
 }
 
+/** 同一模型的高峰 / 空闲两档单价；不分时段的供应商两档填同一份（用 flatRate 构造） */
+interface CnyPricing {
+	peak: CnyRate;
+	offPeak: CnyRate;
+}
+
+/** 不分时段的供应商：峰谷两档同价 */
+function flatRate(rate: CnyRate): CnyPricing {
+	return { peak: rate, offPeak: rate };
+}
+
 /**
  * 官方人民币价目表（¥ / 百万 token），非 USD 换算得来，provider key 对应 BALANCE_APIS 的 key。
  * 只收录已核实的 provider/model；覆盖不到时 exactCnyCost 返回 null，fmtSessionCost 会把这部分原样按 USD 展示。
  * 三家均未公开 cacheWrite 单独计价，按 0 处理。
  *
- * 来源（2026-07-24 核对）：
- * - deepseek: https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+ * 来源（2026-10-03 核对）：
+ * - deepseek: https://api-docs.deepseek.com/zh-cn/quick_start/pricing（flash 分峰谷两档价；pro 0813 版已改价）
  * - kimi:     https://platform.kimi.com/docs/pricing/chat-k3.md（provider key 对应 models.json 里
  *             被注释掉的 "kimi" 自定义 provider，model id "kimi-k3"；留着以备重新启用）
  * - stepfun:  https://platform.stepfun.com/docs/zh/guides/pricing/details
  */
-const CNY_RATES: Partial<Record<string, Record<string, CnyRate>>> = {
+const CNY_RATES: Partial<Record<string, Record<string, CnyPricing>>> = {
 	deepseek: {
-		"deepseek-v4-flash": { input: 1, output: 2, cacheRead: 0.02, cacheWrite: 0 },
-		"deepseek-v4-pro": { input: 3, output: 6, cacheRead: 0.025, cacheWrite: 0 },
+		// DeepSeek-V4.1-Flash 的现行模型名；旧名 deepseek-v4-flash 已下线，请求改由 V4.1-Flash 提供服务
+		"deepseek-flash": {
+			peak: { input: 2, output: 8, cacheRead: 0.04, cacheWrite: 0 },
+			offPeak: { input: 1, output: 4, cacheRead: 0.02, cacheWrite: 0 },
+		},
+		// 改名前的 flat 价，只可能出现在旧会话记录里；保留是为了不让历史会话的数字被新价改写
+		"deepseek-v4-flash": flatRate({ input: 1, output: 2, cacheRead: 0.02, cacheWrite: 0 }),
+		// DeepSeek-V4-Pro-0813 新价；0813 之前的同名会话会被按新价高估，按 model id 无从区分
+		"deepseek-v4-pro": {
+			peak: { input: 9, output: 27, cacheRead: 0.3, cacheWrite: 0 },
+			offPeak: { input: 4.5, output: 13.5, cacheRead: 0.15, cacheWrite: 0 },
+		},
 	},
 	kimi: {
-		"kimi-k3": { input: 20, output: 100, cacheRead: 2, cacheWrite: 0 },
+		"kimi-k3": flatRate({ input: 20, output: 100, cacheRead: 2, cacheWrite: 0 }),
 	},
 	stepfun: {
-		"step-3.7-flash": { input: 1.35, output: 8.1, cacheRead: 0.27, cacheWrite: 0 },
+		"step-3.7-flash": flatRate({ input: 1.35, output: 8.1, cacheRead: 0.27, cacheWrite: 0 }),
 	},
 };
 
-/** 按官方 CNY 价目表算一条消息的真实成本；provider/model 不在表中时返回 null */
+/**
+ * DeepSeek 高峰时段：北京时间（UTC+8，无夏令时）周一至周五 9:00-12:00、14:00-18:00，其余时段半价。
+ * 中国法定节假日也属空闲时段，但节假日表逐年变，这里不内置，落到节假日会按高峰计价（高估）。
+ * 时间不可解析时按高峰返回，宁可高估不低估。
+ */
+export function isPeakHour(at: number | string | Date): boolean {
+	const ms = at instanceof Date ? at.getTime() : typeof at === "number" ? at : Date.parse(at);
+	if (!Number.isFinite(ms)) return true;
+	const bj = new Date(ms + 8 * 3_600_000);
+	const day = bj.getUTCDay(); // 0 = 周日
+	if (day === 0 || day === 6) return false;
+	const minutes = bj.getUTCHours() * 60 + bj.getUTCMinutes();
+	return (minutes >= 9 * 60 && minutes < 12 * 60) || (minutes >= 14 * 60 && minutes < 18 * 60);
+}
+
+/**
+ * 按官方 CNY 价目表算一条消息的真实成本；provider/model 不在表中时返回 null。
+ * at 是该消息的发生时间（session 条目 timestamp），用来选峰谷档；不传时按高峰计价，
+ * 与 pi 自带 USD cost（同样按高峰折算）口径一致。
+ */
 export function exactCnyCost(
 	provider: string,
 	model: string,
 	usage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number },
+	at?: number | string | Date,
 ): number | null {
-	const rate = CNY_RATES[provider]?.[model];
-	if (!rate) return null;
+	const pricing = CNY_RATES[provider]?.[model];
+	if (!pricing) return null;
+	const rate = at !== undefined && !isPeakHour(at) ? pricing.offPeak : pricing.peak;
 	const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 	return (
 		(num(usage.input) * rate.input +
@@ -486,7 +528,8 @@ export default function hud(pi: ExtensionAPI) {
 				const msg = entry.message as { usage?: unknown; provider?: string; model?: string };
 				addUsage(agg, msg.usage);
 				const usage = (typeof msg.usage === "object" && msg.usage !== null ? msg.usage : {}) as Record<string, number>;
-				const exact = msg.provider && msg.model ? exactCnyCost(msg.provider, msg.model, usage) : null;
+				// 传条目 timestamp：DeepSeek 峰谷价要按消息发生时刻逐条选档
+				const exact = msg.provider && msg.model ? exactCnyCost(msg.provider, msg.model, usage, entry.timestamp) : null;
 				if (exact !== null) cnyCost += exact;
 				else uncoveredUsd += usdCostOf(msg.usage);
 			}
