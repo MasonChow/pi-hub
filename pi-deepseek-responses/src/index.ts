@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type {
   Api,
-  Context,
+  TranscriptContext,
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
@@ -152,7 +152,7 @@ export function buildDeepSeekAnthropicStreamOptions(
 
 export function streamDeepSeekAnthropic(
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options?: SimpleStreamOptions,
   adapters: DeepSeekStreamAdapters = defaultStreamAdapters,
 ) {
@@ -178,7 +178,7 @@ export function streamDeepSeekAnthropic(
  */
 export function streamDeepSeekTransport(
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options?: SimpleStreamOptions,
   adapters: DeepSeekStreamAdapters = defaultStreamAdapters,
 ) {
