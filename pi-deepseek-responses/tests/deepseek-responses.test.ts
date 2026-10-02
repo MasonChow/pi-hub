@@ -5,7 +5,8 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt, getCurrentTools, normalizeContext, Type } from "@earendil-works/pi-ai";
+import type { TranscriptContext, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import deepSeekResponsesExtension, {
   buildDeepSeekAnthropicStreamOptions,
   hasNativeWebSearchTool,
@@ -17,7 +18,7 @@ import deepSeekResponsesExtension, {
 } from "../src/index.ts";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const emptyContext = { messages: [] } as Context;
+const emptyContext = normalizeContext({ messages: [] });
 const WEB_SEARCH = { type: "web_search_20250305", name: "web_search" };
 
 function deepseekModel(id: string): Model<"openai-completions"> {
@@ -37,17 +38,17 @@ function deepseekModel(id: string): Model<"openai-completions"> {
 
 function mockAdapters() {
   const calls: {
-    anthropic: Array<{ model: Model<"anthropic-messages">; options?: SimpleStreamOptions }>;
-    completions: Array<{ model: Model<"openai-completions">; options?: SimpleStreamOptions }>;
+    anthropic: Array<{ model: Model<"anthropic-messages">; context: TranscriptContext; options?: SimpleStreamOptions }>;
+    completions: Array<{ model: Model<"openai-completions">; context: TranscriptContext; options?: SimpleStreamOptions }>;
   } = { anthropic: [], completions: [] };
 
   const adapters = {
-    streamAnthropic(model, _context, options) {
-      calls.anthropic.push({ model, options });
+    streamAnthropic(model, context, options) {
+      calls.anthropic.push({ model, context, options });
       return "anthropic-stream" as never;
     },
-    streamOpenAICompletions(model, _context, options) {
-      calls.completions.push({ model, options });
+    streamOpenAICompletions(model, context, options) {
+      calls.completions.push({ model, context, options });
       return "completions-stream" as never;
     },
   } satisfies DeepSeekStreamAdapters;
@@ -202,6 +203,24 @@ test("PI_DEEPSEEK_WEB_SEARCH=0 keeps search-capable models on Pi's original comp
   assert.equal(result, "completions-stream");
   assert.equal(calls.anthropic.length, 0);
   assert.equal(calls.completions[0]?.model.api, "openai-completions");
+});
+
+test("both transports preserve Pi's normalized system prompt and tool declarations", () => {
+  const context = normalizeContext({
+    systemPrompt: "Keep the session instructions stable.",
+    tools: [{ name: "read", description: "Read a file", parameters: Type.Object({ path: Type.String() }) }],
+    messages: [{ role: "user", content: "Read README.md", timestamp: 0 }],
+  });
+
+  for (const id of ["deepseek-flash", "future-model"]) {
+    const { adapters, calls } = mockAdapters();
+    streamDeepSeekTransport(deepseekModel(id), context, undefined, adapters);
+    const received = calls.anthropic[0]?.context ?? calls.completions[0]?.context;
+    assert.equal(received, context, id);
+    assert.ok(received);
+    assert.equal(getCurrentSystemPrompt(received.messages), "Keep the session instructions stable.");
+    assert.deepEqual(getCurrentTools(received.messages).map((tool) => tool.name), ["read"]);
+  }
 });
 
 test("Anthropic path forces cacheRetention none and re-appends web_search after upstream onPayload", async () => {

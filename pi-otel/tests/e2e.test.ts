@@ -70,10 +70,16 @@ function createHost(): FakeHost {
 	const busListeners = new Map<string, Array<(data: unknown) => void>>();
 	const commands: string[] = [];
 	const host: PiOtelHost = {
-		on(event: string, handler: (event: never, ctx: never) => unknown): void {
+		on(event: string, handler: (event: never, ctx: never) => unknown) {
 			const list = handlers.get(event) ?? [];
-			list.push(handler as StoredHandler);
+			// The fake dispatcher stores event-specific callbacks behind one erased signature.
+			const storedHandler = handler as StoredHandler;
+			list.push(storedHandler);
 			handlers.set(event, list);
+			return () => {
+				const index = list.indexOf(storedHandler);
+				if (index >= 0) list.splice(index, 1);
+			};
 		},
 		registerCommand(name) {
 			commands.push(name);
